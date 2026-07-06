@@ -15,7 +15,6 @@ import platform
 # 1. CONFIGURATION & BACKENDS
 # ==========================================
 PORT = 1337
-TOP_N_MODELS = 20
 
 def _get_bridge_config_dir():
     """Get the bridge's own config directory (for API keys), cross-platform."""
@@ -382,7 +381,8 @@ async def chat_completions(request: Request):
                 f"{backend_url}/chat/completions", 
                 json=payload, 
                 headers=headers, 
-                stream=True
+                stream=True,
+                timeout=120
             )
             
             if upstream_req.status_code != 200:
@@ -490,6 +490,9 @@ if __name__ == "__main__":
         if not all_models:
             sys.exit(1)
         selected = interactive_model_selection(args.model, all_models)
+        if not selected:
+            print("No models selected. Exiting.")
+            sys.exit(0)
         generate_opencode_config(selected_models=selected, do_test=args.test)
     else:
         generate_opencode_config(top_n=args.best, do_test=args.test)

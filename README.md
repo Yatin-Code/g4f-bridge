@@ -21,7 +21,7 @@ A powerful, smart, and fully automatic backend proxy bridge designed specificall
 
 2. **Install requirements:**
    ```bash
-   pip install requests fastapi uvicorn
+   pip install -r requirements.txt
    ```
 
 3. **Run the Setup Wizard:**
