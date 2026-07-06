@@ -5,6 +5,7 @@ import uvicorn
 import time
 import argparse
 import sys
+import os
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ==========================================
 PORT = 1337
 TOP_N_MODELS = 20
-CONFIG_PATH = os.path.expanduser("~/.config/opencode-g4f-bridge/keys.json")
+CONFIG_PATH = os.path.expanduser("~/.opencode-g4f-bridge/keys.json")
 
 BACKENDS = {}
 
