@@ -24,10 +24,11 @@ def _get_bridge_config_dir():
     return os.path.join(os.path.expanduser("~"), ".opencode-g4f-bridge")
 
 def _get_opencode_config_dir():
-    """Get OpenCode's config directory, cross-platform."""
-    if platform.system() == "Windows":
-        base = os.environ.get("APPDATA", os.path.expanduser("~"))
-        return os.path.join(base, "opencode")
+    """OpenCode config dir — OpenCode uses ~/.config/opencode on ALL platforms
+    unless XDG_CONFIG_HOME is set, it does NOT use APPDATA on Windows."""
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return os.path.join(xdg, "opencode")
     return os.path.join(os.path.expanduser("~"), ".config", "opencode")
 
 CONFIG_PATH = os.path.join(_get_bridge_config_dir(), "keys.json")
