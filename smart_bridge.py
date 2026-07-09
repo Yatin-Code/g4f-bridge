@@ -311,23 +311,23 @@ def interactive_model_selection(search_terms, all_models):
         print("Invalid choice, please try again.")
 
 def generate_opencode_config(selected_models=None, do_test=False, top_n=None):
-    all_models = get_all_models()
-    if not all_models:
-        print("⚠️ No models fetched. Cannot generate config.")
-        return
-        
     global MODEL_MAP
     MODEL_MAP.clear()
     
-    # Map EVERYTHING so the bridge recognizes any valid model string
-    for m in all_models:
-        MODEL_MAP[m["label"]] = m
-            
     pre_test_models = []
     
     if selected_models is not None:
+        for m in selected_models:
+            MODEL_MAP[m["label"]] = m
         pre_test_models = selected_models
+        all_models = selected_models
     else:
+        all_models = get_all_models()
+        if not all_models:
+            print("⚠️ No models fetched. Cannot generate config.")
+            return
+        for m in all_models:
+            MODEL_MAP[m["label"]] = m
         if top_n is not None:
             if top_n == -1:
                 g4f_top = [m for m in all_models if m["backend"] == "G4F"][:15]
