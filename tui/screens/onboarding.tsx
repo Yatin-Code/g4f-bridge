@@ -1,7 +1,6 @@
 import React, { useState, useCallback } from 'react';
 import { Box, Text, useInput } from 'ink';
 import TextInput from 'ink-text-input';
-import { execSync } from 'node:child_process';
 import AnimatedLogo from '../components/animated-logo.js';
 import Divider from '../components/divider.js';
 import {
@@ -33,7 +32,6 @@ export default function OnboardingScreen({ onComplete, onBack, onExit }: Onboard
   const [focusField, setFocusField] = useState<'g4f' | 'eaon'>('g4f');
   const [ideCursor, setIdeCursor] = useState(0);
   const [installPrompt, setInstallPrompt] = useState<TargetTool | null>(null);
-  const [installStatus, setInstallStatus] = useState<'prompting' | 'installing' | 'error' | null>(null);
   const targetKeys = Object.keys(TARGET_TOOLS) as TargetTool[];
 
   const saveTargets = useCallback((targets: Set<TargetTool>) => {
@@ -43,27 +41,6 @@ export default function OnboardingScreen({ onComplete, onBack, onExit }: Onboard
       selectedModels: prevState.selectedModels,
     });
   }, [prevState.selectedModels]);
-
-  const doInstall = useCallback((target: TargetTool) => {
-    const info = TARGET_TOOLS[target];
-    if (!info.installCmd) {
-      setInstallStatus(null);
-      setInstallPrompt(null);
-      return;
-    }
-    setInstallStatus('installing');
-    try {
-      execSync(info.installCmd, { stdio: 'inherit', timeout: 120000 });
-      setInstallStatus(null);
-      setInstallPrompt(null);
-      const next = new Set(selectedTargets);
-      next.add(target);
-      setSelectedTargets(next);
-      saveTargets(next);
-    } catch {
-      setInstallStatus('error');
-    }
-  }, [selectedTargets, saveTargets]);
 
   const handleNext = useCallback(() => {
     if (step === 0) {
@@ -83,7 +60,7 @@ export default function OnboardingScreen({ onComplete, onBack, onExit }: Onboard
   }, [step, g4fKey, eaonKey, existingKeys, selectedTargets, prevState, onComplete]);
 
   const handleBack = useCallback(() => {
-    if (installPrompt) { setInstallPrompt(null); setInstallStatus(null); return; }
+    if (installPrompt) { setInstallPrompt(null); return; }
     if (step === 0) onExit();
     else setStep(s => s - 1);
   }, [step, onExit, installPrompt]);
@@ -96,19 +73,9 @@ export default function OnboardingScreen({ onComplete, onBack, onExit }: Onboard
     if (key.tab) { setFocusField(f => f === 'g4f' ? 'eaon' : 'g4f'); return; }
 
     if (installPrompt) {
-      if (installStatus === 'error' && (input === 'e' || key.return || key.rightArrow)) {
-        setInstallPrompt(null);
-        setInstallStatus(null);
-        return;
-      }
-      if (input === 'y' || input === 'Y') {
-        doInstall(installPrompt);
-        return;
-      }
-      if (input === 'n' || input === 'N') {
+      if (key.return || input === ' ') {
         const target = installPrompt;
         setInstallPrompt(null);
-        setInstallStatus(null);
         const next = new Set(selectedTargets);
         next.add(target);
         setSelectedTargets(next);
@@ -162,7 +129,7 @@ export default function OnboardingScreen({ onComplete, onBack, onExit }: Onboard
           <StepTools targetKeys={targetKeys} selected={selectedTargets} cursor={ideCursor} />
         )}
         {step === 1 && installPrompt && (
-          <InstallPrompt target={installPrompt} status={installStatus} />
+          <InstallPrompt target={installPrompt} />
         )}
         {step === 2 && (
           <StepSummary g4fKey={g4fKey} eaonKey={eaonKey} targets={selectedTargets} />
@@ -172,8 +139,7 @@ export default function OnboardingScreen({ onComplete, onBack, onExit }: Onboard
       <Footer hints={
         installPrompt
           ? [
-              { key: 'y', label: 'install' },
-              { key: 'n', label: 'skip' },
+              { key: 'Enter', label: 'enable' },
               { key: 'esc', label: 'cancel' },
             ]
           : step === 1
@@ -193,34 +159,17 @@ export default function OnboardingScreen({ onComplete, onBack, onExit }: Onboard
   );
 }
 
-function InstallPrompt({ target, status }: { target: TargetTool; status: 'prompting' | 'installing' | 'error' | null }) {
+function InstallPrompt({ target }: { target: TargetTool }) {
   const info = TARGET_TOOLS[target];
-  if (status === 'installing') {
-    return (
-      <Box flexDirection="column" padding={1} borderStyle="round">
-        <Text bold>Installing {info.name}...</Text>
-      </Box>
-    );
-  }
-  if (status === 'error') {
-    return (
-      <Box flexDirection="column" padding={1} borderStyle="round">
-        <Text bold>Installation failed</Text>
-        <Text>Run manually: {info.installCmd}</Text>
-        <Text dimColor>Press [e] or [Enter] or [→] to dismiss</Text>
-      </Box>
-    );
-  }
   return (
     <Box flexDirection="column" padding={1} borderStyle="round">
       <Text bold>{info.name} is not installed</Text>
       <Box marginTop={1}>
-        <Text>Install with:</Text>
+        <Text>Install it in another terminal:</Text>
         <Text bold>  {info.installCmd}</Text>
       </Box>
       <Box marginTop={1}>
-        <Text>Install now?</Text>
-        <Text>  y (yes) / n (no, just enable) / esc (cancel)</Text>
+        <Text>Then come back and press Enter to enable it</Text>
       </Box>
     </Box>
   );
