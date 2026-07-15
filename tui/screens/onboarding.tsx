@@ -1,6 +1,7 @@
 import React, { useState, useCallback } from 'react';
 import { Box, Text, useInput } from 'ink';
 import TextInput from 'ink-text-input';
+import { execSync } from 'node:child_process';
 import AnimatedLogo from '../components/animated-logo.js';
 import Divider from '../components/divider.js';
 import {
@@ -31,7 +32,38 @@ export default function OnboardingScreen({ onComplete, onBack, onExit }: Onboard
   );
   const [focusField, setFocusField] = useState<'g4f' | 'eaon'>('g4f');
   const [ideCursor, setIdeCursor] = useState(0);
+  const [installPrompt, setInstallPrompt] = useState<TargetTool | null>(null);
+  const [installStatus, setInstallStatus] = useState<'prompting' | 'installing' | 'error' | null>(null);
   const targetKeys = Object.keys(TARGET_TOOLS) as TargetTool[];
+
+  const saveTargets = useCallback((targets: Set<TargetTool>) => {
+    saveOnboardingState({
+      completed: false,
+      selectedTargets: Array.from(targets),
+      selectedModels: prevState.selectedModels,
+    });
+  }, [prevState.selectedModels]);
+
+  const doInstall = useCallback((target: TargetTool) => {
+    const info = TARGET_TOOLS[target];
+    if (!info.installCmd) {
+      setInstallStatus(null);
+      setInstallPrompt(null);
+      return;
+    }
+    setInstallStatus('installing');
+    try {
+      execSync(info.installCmd, { stdio: 'inherit', timeout: 120000 });
+      setInstallStatus(null);
+      setInstallPrompt(null);
+      const next = new Set(selectedTargets);
+      next.add(target);
+      setSelectedTargets(next);
+      saveTargets(next);
+    } catch {
+      setInstallStatus('error');
+    }
+  }, [selectedTargets, saveTargets]);
 
   const handleNext = useCallback(() => {
     if (step === 0) {
@@ -51,23 +83,41 @@ export default function OnboardingScreen({ onComplete, onBack, onExit }: Onboard
   }, [step, g4fKey, eaonKey, existingKeys, selectedTargets, prevState, onComplete]);
 
   const handleBack = useCallback(() => {
+    if (installPrompt) { setInstallPrompt(null); setInstallStatus(null); return; }
     if (step === 0) onExit();
     else setStep(s => s - 1);
-  }, [step, onExit]);
-
-  const toggleTarget = useCallback((target: TargetTool) => {
-    setSelectedTargets(prev => {
-      const next = new Set(prev);
-      if (next.has(target)) next.delete(target);
-      else next.add(target);
-      return next;
-    });
-  }, []);
+  }, [step, onExit, installPrompt]);
 
   useInput((input, key) => {
     if (key.escape) { handleBack(); return; }
-    if (key.rightArrow) { handleNext(); return; }
+    if (key.rightArrow) {
+      if (!installPrompt) { handleNext(); return; }
+    }
     if (key.tab) { setFocusField(f => f === 'g4f' ? 'eaon' : 'g4f'); return; }
+
+    if (installPrompt) {
+      if (installStatus === 'error' && (input === 'e' || key.return || key.rightArrow)) {
+        setInstallPrompt(null);
+        setInstallStatus(null);
+        return;
+      }
+      if (input === 'y' || input === 'Y') {
+        doInstall(installPrompt);
+        return;
+      }
+      if (input === 'n' || input === 'N') {
+        const target = installPrompt;
+        setInstallPrompt(null);
+        setInstallStatus(null);
+        const next = new Set(selectedTargets);
+        next.add(target);
+        setSelectedTargets(next);
+        saveTargets(next);
+        return;
+      }
+      return;
+    }
+
     if (step === 1) {
       if (key.upArrow) {
         setIdeCursor(i => (i > 0 ? i - 1 : targetKeys.length - 1));
@@ -79,15 +129,17 @@ export default function OnboardingScreen({ onComplete, onBack, onExit }: Onboard
       }
       if (key.return || input === ' ') {
         const target = targetKeys[ideCursor];
+        const { installed } = checkToolInstalled(target);
+        if (!installed && TARGET_TOOLS[target].installCmd) {
+          setInstallPrompt(target);
+          setInstallStatus('prompting');
+          return;
+        }
         const next = new Set(selectedTargets);
         if (next.has(target)) next.delete(target);
         else next.add(target);
         setSelectedTargets(next);
-        saveOnboardingState({
-          completed: false,
-          selectedTargets: Array.from(next),
-          selectedModels: prevState.selectedModels,
-        });
+        saveTargets(next);
         return;
       }
     }
@@ -106,8 +158,11 @@ export default function OnboardingScreen({ onComplete, onBack, onExit }: Onboard
         {step === 0 && (
           <StepKeys g4fKey={g4fKey} eaonKey={eaonKey} onG4fChange={setG4fKey} onEaonChange={setEaonKey} focusField={focusField} />
         )}
-        {step === 1 && (
-          <StepTools targetKeys={targetKeys} selected={selectedTargets} onToggle={toggleTarget} cursor={ideCursor} />
+        {step === 1 && !installPrompt && (
+          <StepTools targetKeys={targetKeys} selected={selectedTargets} cursor={ideCursor} />
+        )}
+        {step === 1 && installPrompt && (
+          <InstallPrompt target={installPrompt} status={installStatus} />
         )}
         {step === 2 && (
           <StepSummary g4fKey={g4fKey} eaonKey={eaonKey} targets={selectedTargets} />
@@ -115,7 +170,13 @@ export default function OnboardingScreen({ onComplete, onBack, onExit }: Onboard
       </Box>
 
       <Footer hints={
-        step === 1
+        installPrompt
+          ? [
+              { key: 'y', label: 'install' },
+              { key: 'n', label: 'skip' },
+              { key: 'esc', label: 'cancel' },
+            ]
+          : step === 1
           ? [
               { key: '↑↓', label: 'navigate' },
               { key: 'Enter', label: 'toggle' },
@@ -128,6 +189,39 @@ export default function OnboardingScreen({ onComplete, onBack, onExit }: Onboard
               { key: 'Tab', label: 'switch' },
             ]
       } />
+    </Box>
+  );
+}
+
+function InstallPrompt({ target, status }: { target: TargetTool; status: 'prompting' | 'installing' | 'error' | null }) {
+  const info = TARGET_TOOLS[target];
+  if (status === 'installing') {
+    return (
+      <Box flexDirection="column" padding={1} borderStyle="round">
+        <Text bold>Installing {info.name}...</Text>
+      </Box>
+    );
+  }
+  if (status === 'error') {
+    return (
+      <Box flexDirection="column" padding={1} borderStyle="round">
+        <Text bold>Installation failed</Text>
+        <Text>Run manually: {info.installCmd}</Text>
+        <Text dimColor>Press [e] or [Enter] or [→] to dismiss</Text>
+      </Box>
+    );
+  }
+  return (
+    <Box flexDirection="column" padding={1} borderStyle="round">
+      <Text bold>{info.name} is not installed</Text>
+      <Box marginTop={1}>
+        <Text>Install with:</Text>
+        <Text bold>  {info.installCmd}</Text>
+      </Box>
+      <Box marginTop={1}>
+        <Text>Install now?</Text>
+        <Text>  y (yes) / n (no, just enable) / esc (cancel)</Text>
+      </Box>
     </Box>
   );
 }
@@ -153,8 +247,8 @@ function StepKeys({ g4fKey, eaonKey, onG4fChange, onEaonChange, focusField }: {
   );
 }
 
-function StepTools({ targetKeys, selected, onToggle, cursor }: {
-  targetKeys: TargetTool[]; selected: Set<TargetTool>; onToggle: (t: TargetTool) => void; cursor: number;
+function StepTools({ targetKeys, selected, cursor }: {
+  targetKeys: TargetTool[]; selected: Set<TargetTool>; cursor: number;
 }) {
   return (
     <Box flexDirection="column">

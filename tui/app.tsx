@@ -17,13 +17,11 @@ interface AppProps {
 export default function App({ initialScreen }: AppProps) {
   const { exit } = useApp();
 
-  const getInitialScreen = (): Screen => {
+  const [screen, setScreen] = useState<Screen>(() => {
     if (initialScreen) return initialScreen;
     if (isFirstRun()) return 'onboarding';
-    return 'welcome';
-  };
-
-  const [screen, setScreen] = useState<Screen>(getInitialScreen);
+    return 'dashboard';
+  });
   const [health, setHealth] = useState<HealthStatus>(() => {
     const keys = loadKeys();
     const keyStatus: Record<string, boolean> = {};
@@ -44,6 +42,18 @@ export default function App({ initialScreen }: AppProps) {
   const checkHealth = useCallback(async () => {
     const running = await checkBridgeHealth();
     setHealth(prev => ({ ...prev, bridge: running ? 'running' : 'stopped' }));
+  }, []);
+
+  useEffect(() => {
+    if (!isFirstRun() && screen === 'dashboard') {
+      const state = loadOnboardingState();
+      const args = ['-b'];
+      if (state.selectedTargets.length > 0) {
+        args.push('--target', ...state.selectedTargets);
+      }
+      setHealth(prev => ({ ...prev, bridge: 'starting' }));
+      bridge.start(args);
+    }
   }, []);
 
   useEffect(() => {
