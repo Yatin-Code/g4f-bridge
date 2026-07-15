@@ -99,7 +99,6 @@ export default function OnboardingScreen({ onComplete, onBack, onExit }: Onboard
         const { installed } = checkToolInstalled(target);
         if (!installed && TARGET_TOOLS[target].installCmd) {
           setInstallPrompt(target);
-          setInstallStatus('prompting');
           return;
         }
         const next = new Set(selectedTargets);
