@@ -45,18 +45,6 @@ export default function App({ initialScreen }: AppProps) {
   }, []);
 
   useEffect(() => {
-    if (!isFirstRun() && screen === 'dashboard') {
-      const state = loadOnboardingState();
-      const args = ['-b'];
-      if (state.selectedTargets.length > 0) {
-        args.push('--target', ...state.selectedTargets);
-      }
-      setHealth(prev => ({ ...prev, bridge: 'starting' }));
-      bridge.start(args);
-    }
-  }, []);
-
-  useEffect(() => {
     const interval = setInterval(checkHealth, 3000);
     return () => clearInterval(interval);
   }, [checkHealth]);

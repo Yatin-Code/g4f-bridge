@@ -671,18 +671,18 @@ def generate_opencode_config(selected_models=None, do_test=False, top_n=None, ta
         if claude_name not in seen_short and claude_name != label:
             seen_short.add(claude_name)
             CLAUDE_MODEL_MAP[claude_name] = m
-        if top_n is not None:
-            if top_n == -1:
-                g4f_top = [m for m in all_models if m["backend"] == "G4F"][:15]
-                eaon_top = [m for m in all_models if m["backend"] == "EAON" and m.get("tier") == "plus"]
-                print(f"Selecting Top 15 models from G4F and ALL {len(eaon_top)} plus-tier models from EAON.")
-            else:
-                g4f_top = [m for m in all_models if m["backend"] == "G4F"][:top_n]
-                eaon_top = [m for m in all_models if m["backend"] == "EAON" and m.get("tier") == "plus"][:top_n]
-                print(f"Selecting Top {top_n} models from G4F and Top {top_n} plus-tier models from EAON.")
-            pre_test_models = g4f_top + eaon_top
+    if top_n is not None:
+        if top_n == -1:
+            g4f_top = [m for m in all_models if m["backend"] == "G4F"][:15]
+            eaon_top = [m for m in all_models if m["backend"] == "EAON" and m.get("tier") == "plus"]
+            print(f"Selecting Top 15 models from G4F and ALL {len(eaon_top)} plus-tier models from EAON.")
         else:
-            pre_test_models = all_models
+            g4f_top = [m for m in all_models if m["backend"] == "G4F"][:top_n]
+            eaon_top = [m for m in all_models if m["backend"] == "EAON" and m.get("tier") == "plus"][:top_n]
+            print(f"Selecting Top {top_n} models from G4F and Top {top_n} plus-tier models from EAON.")
+        pre_test_models = g4f_top + eaon_top
+    else:
+        pre_test_models = all_models
 
     final_models = []
     if do_test:
