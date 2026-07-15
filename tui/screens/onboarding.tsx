@@ -29,6 +29,8 @@ export default function OnboardingScreen({ onComplete, onBack }: OnboardingScree
     new Set(prevState.selectedTargets.length > 0 ? prevState.selectedTargets : ['opencode'])
   );
   const [focusField, setFocusField] = useState<'g4f' | 'eaon'>('g4f');
+  const [ideCursor, setIdeCursor] = useState(0);
+  const targetKeys = Object.keys(TARGET_TOOLS) as TargetTool[];
 
   const handleNext = useCallback(() => {
     if (step === 0) {
@@ -36,6 +38,7 @@ export default function OnboardingScreen({ onComplete, onBack }: OnboardingScree
     }
     if (step < 2) {
       setStep(s => s + 1);
+      setIdeCursor(0);
     } else {
       saveOnboardingState({
         completed: true,
@@ -64,6 +67,20 @@ export default function OnboardingScreen({ onComplete, onBack }: OnboardingScree
     if (key.escape) { handleBack(); return; }
     if (key.return) { handleNext(); return; }
     if (key.tab) { setFocusField(f => f === 'g4f' ? 'eaon' : 'g4f'); return; }
+    if (step === 1) {
+      if (key.upArrow) {
+        setIdeCursor(i => (i > 0 ? i - 1 : targetKeys.length - 1));
+        return;
+      }
+      if (key.downArrow) {
+        setIdeCursor(i => (i < targetKeys.length - 1 ? i + 1 : 0));
+        return;
+      }
+      if (input === ' ') {
+        toggleTarget(targetKeys[ideCursor]);
+        return;
+      }
+    }
   });
 
   return (
@@ -80,18 +97,27 @@ export default function OnboardingScreen({ onComplete, onBack }: OnboardingScree
           <StepKeys g4fKey={g4fKey} eaonKey={eaonKey} onG4fChange={setG4fKey} onEaonChange={setEaonKey} focusField={focusField} />
         )}
         {step === 1 && (
-          <StepTools selected={selectedTargets} onToggle={toggleTarget} />
+          <StepTools targetKeys={targetKeys} selected={selectedTargets} onToggle={toggleTarget} cursor={ideCursor} />
         )}
         {step === 2 && (
           <StepSummary g4fKey={g4fKey} eaonKey={eaonKey} targets={selectedTargets} />
         )}
       </Box>
 
-      <Footer hints={[
-        { key: 'Enter', label: step < 2 ? 'next' : 'launch' },
-        { key: 'esc', label: step === 0 ? 'back' : 'prev' },
-        { key: 'Tab', label: 'switch' },
-      ]} />
+      <Footer hints={
+        step === 1
+          ? [
+              { key: '↑↓', label: 'navigate' },
+              { key: 'Space', label: 'toggle' },
+              { key: 'Enter', label: 'next' },
+              { key: 'esc', label: 'prev' },
+            ]
+          : [
+              { key: 'Enter', label: step < 2 ? 'next' : 'launch' },
+              { key: 'esc', label: step === 0 ? 'back' : 'prev' },
+              { key: 'Tab', label: 'switch' },
+            ]
+      } />
     </Box>
   );
 }
@@ -117,24 +143,29 @@ function StepKeys({ g4fKey, eaonKey, onG4fChange, onEaonChange, focusField }: {
   );
 }
 
-function StepTools({ selected, onToggle }: {
-  selected: Set<TargetTool>; onToggle: (t: TargetTool) => void;
+function StepTools({ targetKeys, selected, onToggle, cursor }: {
+  targetKeys: TargetTool[]; selected: Set<TargetTool>; onToggle: (t: TargetTool) => void; cursor: number;
 }) {
   return (
     <Box flexDirection="column">
-      {Object.entries(TARGET_TOOLS).map(([id, info]) => {
-        const target = id as TargetTool;
+      {targetKeys.map((target, i) => {
+        const info = TARGET_TOOLS[target];
         const isSelected = selected.has(target);
+        const isCursor = i === cursor;
         const { installed } = checkToolInstalled(target);
         return (
-          <Box key={id}>
-            <Text bold={isSelected}>{isSelected ? '◉' : '○'}</Text>
-            <Text> {info.name}</Text>
+          <Box key={target}>
+            <Text bold={isCursor}>{isCursor ? '▸' : ' '}</Text>
+            <Text bold={isSelected}>{isSelected ? ' ◉' : ' ○'}</Text>
+            <Text bold={isCursor}> {info.name}</Text>
             <Text dimColor>  {installed ? '✓ installed' : 'not found'}</Text>
             {isSelected && <Text dimColor>  → {info.configFile}</Text>}
           </Box>
         );
       })}
+      <Box marginTop={1}>
+        <Text dimColor>Space to toggle  ·  Enter when done</Text>
+      </Box>
     </Box>
   );
 }
