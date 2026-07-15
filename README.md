@@ -28,8 +28,8 @@
 ## Quick Start
 
 ```bash
-git clone https://github.com/Yatin-Code/opencode-g4f-bridge.git
-cd opencode-g4f-bridge
+git clone https://github.com/Yatin-Code/g4f-bridge.git
+cd g4f-bridge
 pip install -r requirements.txt
 npm install && npm run build
 pip install -e .
@@ -53,6 +53,8 @@ g4f-bridge dashboard      Live logs
 
 **CLI**
 ```
+g4f-bridge -l                 List all models from all proxies
+g4f-bridge -l 10              List top 10 models
 g4f-bridge -b                 Auto-select top 15 models
 g4f-bridge -b 5               Top 5 models
 g4f-bridge -m gpt             Search by name
