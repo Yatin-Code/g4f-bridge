@@ -1,0 +1,15 @@
+{
+  "name": "g4f-bridge-monorepo",
+  "version": "2.0.0",
+  "private": true,
+  "workspaces": ["tui"],
+  "bin": {
+    "g4f-bridge": "tui/dist/index.js"
+  },
+  "scripts": {
+    "dev": "npm run dev -w tui",
+    "build": "npm run build -w tui",
+    "start": "npm run start -w tui",
+    "install-python": "pip install -e ."
+  }
+}

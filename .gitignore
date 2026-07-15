@@ -6,6 +6,10 @@ dist/
 build/
 *.egg
 
+# Node.js
+node_modules/
+tui/dist/
+
 # IDE
 .vscode/
 .idea/

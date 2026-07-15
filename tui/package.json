@@ -1,0 +1,31 @@
+{
+  "name": "g4f-bridge",
+  "version": "2.0.0",
+  "description": "Multi-tool API bridge for G4F and EAON proxy networks — TUI",
+  "type": "module",
+  "bin": {
+    "g4f-bridge": "./dist/index.js"
+  },
+  "scripts": {
+    "dev": "tsx index.tsx",
+    "build": "tsup",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "chalk": "^5.3.0",
+    "ink": "^7.1.0",
+    "ink-big-text": "^2.0.0",
+
+    "ink-gradient": "^4.0.1",
+    "ink-select-input": "^6.2.0",
+    "ink-spinner": "^5.0.0",
+    "ink-text-input": "^6.0.0",
+    "react": "^19.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "tsup": "^8.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.5.0"
+  }
+}

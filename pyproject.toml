@@ -1,0 +1,20 @@
+[project]
+name = "g4f-bridge"
+version = "1.0.0"
+description = "Multi-tool API bridge for G4F and EAON proxy networks"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.20.0",
+    "requests>=2.28.0",
+]
+
+[project.scripts]
+g4f-bridge = "src.bridge.main:cli_main"
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
