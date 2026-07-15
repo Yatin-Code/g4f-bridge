@@ -66,7 +66,7 @@ export default function OnboardingScreen({ onComplete, onBack, onExit }: Onboard
 
   useInput((input, key) => {
     if (key.escape) { handleBack(); return; }
-    if (key.return) { handleNext(); return; }
+    if (key.rightArrow) { handleNext(); return; }
     if (key.tab) { setFocusField(f => f === 'g4f' ? 'eaon' : 'g4f'); return; }
     if (step === 1) {
       if (key.upArrow) {
@@ -77,8 +77,17 @@ export default function OnboardingScreen({ onComplete, onBack, onExit }: Onboard
         setIdeCursor(i => (i < targetKeys.length - 1 ? i + 1 : 0));
         return;
       }
-      if (input === ' ') {
-        toggleTarget(targetKeys[ideCursor]);
+      if (key.return || input === ' ') {
+        const target = targetKeys[ideCursor];
+        const next = new Set(selectedTargets);
+        if (next.has(target)) next.delete(target);
+        else next.add(target);
+        setSelectedTargets(next);
+        saveOnboardingState({
+          completed: false,
+          selectedTargets: Array.from(next),
+          selectedModels: prevState.selectedModels,
+        });
         return;
       }
     }
@@ -109,12 +118,12 @@ export default function OnboardingScreen({ onComplete, onBack, onExit }: Onboard
         step === 1
           ? [
               { key: '↑↓', label: 'navigate' },
-              { key: 'Space', label: 'toggle' },
-              { key: 'Enter', label: 'next' },
+              { key: 'Enter', label: 'toggle' },
+              { key: '→', label: 'next' },
               { key: 'esc', label: 'prev' },
             ]
           : [
-              { key: 'Enter', label: step < 2 ? 'next' : 'launch' },
+              { key: '→', label: step < 2 ? 'next' : 'launch' },
               { key: 'esc', label: step === 0 ? 'quit' : 'prev' },
               { key: 'Tab', label: 'switch' },
             ]
@@ -165,7 +174,7 @@ function StepTools({ targetKeys, selected, onToggle, cursor }: {
         );
       })}
       <Box marginTop={1}>
-        <Text dimColor>Space to toggle  ·  Enter when done</Text>
+        <Text dimColor>Enter to toggle  ·  → when done</Text>
       </Box>
     </Box>
   );
