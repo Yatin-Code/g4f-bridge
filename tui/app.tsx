@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useEffect } from 'react';
-import { Box, Text, useInput, useApp } from 'ink';
+import { useApp } from 'ink';
 import type { Screen, HealthStatus } from './lib/types.js';
 import { loadKeys, isFirstRun, loadOnboardingState } from './lib/config-paths.js';
 import { healthCheck as checkBridgeHealth } from './lib/api.js';
@@ -61,17 +61,6 @@ export default function App({ initialScreen }: AppProps) {
     return () => clearInterval(interval);
   }, [checkHealth]);
 
-  useInput((input, key) => {
-    if (key.escape) {
-      if (screen === 'welcome' || screen === 'dashboard') {
-        bridge.destroy();
-        exit();
-      } else {
-        setScreen('welcome');
-      }
-    }
-  });
-
   const getBridgeArgs = useCallback((): string[] => {
     const state = loadOnboardingState();
     const args = ['-b'];
@@ -120,7 +109,8 @@ export default function App({ initialScreen }: AppProps) {
       return (
         <DashboardScreen
           health={health}
-          onStop={() => { bridge.stop(); setScreen('welcome'); }}
+          onStop={() => bridge.stop()}
+          onExit={() => { bridge.destroy(); exit(); }}
           onSettings={() => setScreen('settings')}
           onModelPicker={() => setScreen('model-picker')}
         />

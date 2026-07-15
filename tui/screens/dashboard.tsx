@@ -8,6 +8,7 @@ import Footer from '../components/footer.js';
 interface DashboardScreenProps {
   health: HealthStatus;
   onStop: () => void;
+  onExit: () => void;
   onSettings: () => void;
   onModelPicker: () => void;
 }
@@ -19,7 +20,7 @@ interface LogEntry {
   level: 'info' | 'error' | 'warn';
 }
 
-export default function DashboardScreen({ health, onStop, onSettings, onModelPicker }: DashboardScreenProps) {
+export default function DashboardScreen({ health, onStop, onExit, onSettings, onModelPicker }: DashboardScreenProps) {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const logIdRef = useRef(0);
 
@@ -48,7 +49,9 @@ export default function DashboardScreen({ health, onStop, onSettings, onModelPic
   }, []);
 
   useInput((input, key) => {
-    if (input === 'q' || key.escape) {
+    if (input === 'q') {
+      onExit();
+    } else if (key.escape) {
       onStop();
     } else if (input === 'r') {
       bridge.restart();
@@ -117,7 +120,8 @@ export default function DashboardScreen({ health, onStop, onSettings, onModelPic
       <Divider />
 
       <Footer hints={[
-        { key: 'q', label: 'stop' },
+        { key: 'q', label: 'quit' },
+        { key: 'esc', label: 'stop' },
         { key: 'r', label: 'restart' },
         { key: 'c', label: 'config' },
         { key: 'm', label: 'models' },
