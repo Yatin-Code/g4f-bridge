@@ -89,9 +89,9 @@ Your Tool ──► g4f-bridge:1337 ──► G4F / EAON
 | :--- | :--- | :--- | :--- |
 | OpenCode | ~/.config/opencode/opencode.json | @ai-sdk/openai-compatible | ✅ Working |
 | Claude Code | ~/.claude/settings.json | Anthropic env vars | ✅ Working |
-| Codex CLI | ~/.codex/config.toml | Custom provider |  |
-| Cursor | ~/.cursor/settings.json | OpenAI API |  |
-| Antigravity | ~/.gemini/settings.json | Base URL |  |
+| Codex CLI | ~/.codex/config.toml | Custom provider | ⚠️ Beta |
+| Cursor | ~/.cursor/settings.json | OpenAI API | ❌ In Devlopment  |
+| Antigravity | ~/.gemini/settings.json | Base URL | ❌ In Devlopment |
 
 ---
 
