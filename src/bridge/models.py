@@ -1,13 +1,12 @@
-import json
-import sys
-import requests
+import json, sys, logging, requests
 from .utils import BACKENDS
+
+logger = logging.getLogger("g4f-bridge.models")
 
 MODEL_MAP = {}
 CLAUDE_MODEL_MAP = {}
 EAON_OPERATIONAL_MODELS = set()
 ACTIVE_MODELS = set()
-
 
 def _resolve_model(requested_label):
     if requested_label in MODEL_MAP:
@@ -16,14 +15,16 @@ def _resolve_model(requested_label):
         return CLAUDE_MODEL_MAP[requested_label]
     return None
 
-
 def get_all_models():
     all_models = []
 
     if "G4F" in BACKENDS:
-        print(f"Fetching models from {BACKENDS['G4F']['url']}/models ...")
+        logger.info(f"Fetching models from {BACKENDS['G4F']['url']}/models")
         try:
-            resp = requests.get(f"{BACKENDS['G4F']['url']}/models", headers={"Authorization": f"Bearer {BACKENDS['G4F']['key']}"})
+            resp = requests.get(
+                f"{BACKENDS['G4F']['url']}/models",
+                headers={"Authorization": f"Bearer {BACKENDS['G4F']['key']}"}
+            )
             resp.raise_for_status()
             data = resp.json().get("data", [])
             for m in data:
@@ -35,30 +36,59 @@ def get_all_models():
                     "requests": m.get("requests", 0),
                     "backend": "G4F"
                 })
+            logger.info(f"  -> {len([m for m in all_models if m['backend']=='G4F'])} G4F models")
         except Exception as e:
-            print(f"Failed to fetch G4F models: {e}")
+            logger.warning(f"Failed to fetch G4F models: {e}")
 
     if "EAON" in BACKENDS:
         eaon_models = fetch_eaon_catalog()
         all_models.extend(eaon_models)
-
-    if "EAON" in BACKENDS:
+        before = len([m for m in all_models if m["backend"] == "EAON"])
         monitor_operational = fetch_eaon_monitor()
         if monitor_operational:
-            before = len([m for m in all_models if m["backend"] == "EAON"])
             all_models = [m for m in all_models if m["backend"] != "EAON" or m["id"] in monitor_operational]
             after = len([m for m in all_models if m["backend"] == "EAON"])
             if before > after:
-                print(f"  -> Filtered out {before - after} non-operational EAON models")
+                logger.info(f"  -> Filtered out {before - after} non-operational EAON models")
+
+    if "PA" in BACKENDS:
+        pa_url = BACKENDS["PA"]["url"].rstrip("/")
+        logger.info(f"Fetching PA providers from {pa_url}/pa/providers")
+        try:
+            resp = requests.get(f"{pa_url}/pa/providers", timeout=15)
+            if resp.status_code == 200:
+                providers = resp.json()
+                total = 0
+                for prov in providers:
+                    label = prov.get("label", "?")
+                    models = prov.get("models", [])
+                    for mid in models:
+                        if mid and mid.strip():
+                            all_models.append({
+                                "id": mid,
+                                "label": f"PA:{label}:{mid}",
+                                "model": mid,
+                                "requests": 0,
+                                "backend": "PA",
+                                "provider_id": prov.get("id", ""),
+                            })
+                            total += 1
+                logger.info(f"  -> {total} PA models from {len(providers)} providers")
+                if providers:
+                    for prov in providers:
+                        logger.info(f"     {prov.get('label','?')}: {len(prov.get('models',[]))} models")
+            else:
+                logger.warning(f"PA providers endpoint returned {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Failed to fetch PA providers: {e}")
 
     all_models = sorted(all_models, key=lambda x: x["requests"], reverse=True)
     return all_models
 
-
 def fetch_eaon_catalog():
     if "EAON" not in BACKENDS:
         return []
-    print("Fetching EAON model catalog...")
+    logger.info("Fetching EAON model catalog")
     try:
         resp = requests.get(
             f"{BACKENDS['EAON']['url']}/models/catalog",
@@ -80,19 +110,18 @@ def fetch_eaon_catalog():
             })
         instant_count = len([m for m in result if m["tier"] == "instant"])
         plus_count = len([m for m in result if m["tier"] == "plus"])
-        print(f"  -> {len(result)} EAON models found ({instant_count} instant, {plus_count} plus)")
+        logger.info(f"  -> {len(result)} EAON models ({instant_count} instant, {plus_count} plus)")
         return result
     except Exception as e:
-        print(f"Failed to fetch EAON catalog: {e}")
+        logger.warning(f"Failed to fetch EAON catalog: {e}")
         return []
-
 
 def fetch_eaon_monitor():
     global EAON_OPERATIONAL_MODELS
     if "EAON" not in BACKENDS:
         EAON_OPERATIONAL_MODELS = set()
         return set()
-    print("Checking EAON model health...")
+    logger.info("Checking EAON model health")
     try:
         resp = requests.get(
             f"{BACKENDS['EAON']['url']}/monitor/models",
@@ -102,17 +131,16 @@ def fetch_eaon_monitor():
         data = resp.json().get("data", [])
         operational = {m.get("id") for m in data if m.get("status") == "operational"}
         EAON_OPERATIONAL_MODELS = operational
-        print(f"  -> {len(operational)} operational EAON models")
+        logger.info(f"  -> {len(operational)} operational EAON models")
         unavailable = [m for m in data if m.get("status") != "operational"]
         if unavailable:
             for m in unavailable:
-                print(f"     {m.get('id')}: {m.get('status')}")
+                logger.debug(f"     {m.get('id')}: {m.get('status')}")
         return operational
     except Exception as e:
-        print(f"Failed to fetch EAON monitor: {e}")
+        logger.warning(f"Failed to fetch EAON monitor: {e}")
         EAON_OPERATIONAL_MODELS = set()
         return set()
-
 
 def test_model_live(model_obj):
     label = model_obj["label"]
@@ -121,14 +149,14 @@ def test_model_live(model_obj):
 
     if backend == "EAON":
         if model_id in EAON_OPERATIONAL_MODELS:
-            print(f"  Model '{label}' is operational per EAON monitor — proceeding to stress test...")
+            logger.info(f"  Model '{label}' is operational per EAON monitor — proceeding to stress test")
         elif EAON_OPERATIONAL_MODELS:
-            print(f"  Model '{label}' is NOT operational per EAON monitor. Skipping.")
+            logger.warning(f"  Model '{label}' is NOT operational per EAON monitor. Skipping.")
             return False
         else:
-            print(f"  No monitor data for '{label}' — proceeding directly to stress test...")
+            logger.info(f"  No monitor data for '{label}' — proceeding directly to stress test")
 
-    print(f"  Testing model '{label}' via {backend} backend...")
+    logger.info(f"  Testing model '{label}' via {backend} backend")
 
     large_context = "This is a dummy context string to test large context windows. " * 1500
 
@@ -180,24 +208,23 @@ def test_model_live(model_obj):
                     continue
             resp.close()
             if saw_tool_call:
-                print(f"    Tool call confirmed — model supports function calling")
+                logger.info(f"    Tool call confirmed — model supports function calling")
                 return True
             elif saw_content:
-                print(f"    Model streamed text but never called the tool")
+                logger.warning(f"    Model streamed text but never called the tool")
                 return False
             else:
-                print(f"    Empty stream received")
+                logger.warning(f"    Empty stream received")
                 return False
         else:
-            print(f"    Failed with {resp.status_code}: {resp.text[:100]}")
+            logger.warning(f"    Failed with {resp.status_code}: {resp.text[:100]}")
             return False
     except requests.exceptions.Timeout:
-        print(f"    Failed: Connection timed out after 25 seconds.")
+        logger.warning(f"    Failed: Connection timed out after 25 seconds.")
         return False
     except Exception as e:
-        print(f"    Failed with exception: {e}")
+        logger.warning(f"    Failed with exception: {e}")
         return False
-
 
 def interactive_model_selection(search_terms, all_models):
     seen = set()
@@ -210,7 +237,7 @@ def interactive_model_selection(search_terms, all_models):
                 matches.append(m)
     if not matches:
         terms = "', '".join(search_terms)
-        print(f"No models found matching '{terms}'.")
+        logger.warning(f"No models found matching '{terms}'.")
         return []
 
     terms = "', '".join(search_terms)

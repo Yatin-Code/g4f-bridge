@@ -1,11 +1,7 @@
-import json
-import sys
-import time
-import uuid
-import argparse
-import traceback
+import json, sys, time, uuid, argparse, logging
 from datetime import datetime, timezone
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -14,10 +10,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from .utils import (
     BACKENDS, STRIP_PARAMS_BY_BACKEND,
     ALL_TARGETS, TARGET_CHOICES,
-    load_or_prompt_keys,
-    _run_preflight_checks,
-    _detect_config_conflicts,
-    _safe_write_json,
+    load_or_prompt_keys, manage_keys,
+    _run_preflight_checks, _detect_config_conflicts,
+    _safe_write_json, setup_logging,
+    increment_requests, decrement_requests, log_request_status,
 )
 from .models import (
     MODEL_MAP, CLAUDE_MODEL_MAP, ACTIVE_MODELS,
@@ -25,8 +21,8 @@ from .models import (
     _resolve_model,
 )
 from .translate import (
-    _post_with_retry,
-    _anthropic_to_openai,
+    _post_with_retry, _async_post_stream,
+    _anthropic_to_openai, _normalize_openai_messages,
     _openai_chunk_to_anthropic_events,
     _openai_response_to_anthropic,
     _gemini_to_openai,
@@ -38,7 +34,12 @@ from .translate import (
 )
 from ..configs import opencode, claude_code, codex, cursor, antigravity
 
+logger = logging.getLogger("g4f-bridge")
+
 PORT = 1337
+
+def _req_id(request):
+    return getattr(request.state, 'req_id', '--------')
 
 app = FastAPI()
 
@@ -50,8 +51,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# ---- Model Discovery ----
+@app.middleware("http")
+async def track_requests(request: Request, call_next):
+    req_id = uuid.uuid4().hex[:8]
+    request.state.req_id = req_id
+    increment_requests()
+    log_request_status()
+    start = time.time()
+    response = await call_next(request)
+    elapsed = time.time() - start
+    decrement_requests()
+    logger.info(f"[{req_id}] {request.method} {request.url.path} completed in {elapsed:.2f}s")
+    log_request_status()
+    return response
 
 @app.get("/v1/models")
 async def list_models(request: Request):
@@ -93,9 +105,6 @@ async def list_models(request: Request):
     all_entries = models + claude_entries
     return {"object": "list", "data": all_entries}
 
-
-# ---- Anthropic Messages API ----
-
 @app.post("/v1/messages/count_tokens")
 async def anthropic_count_tokens(request: Request):
     try:
@@ -120,7 +129,6 @@ async def anthropic_count_tokens(request: Request):
             "error": {"type": "api_error", "message": str(e)}
         })
 
-
 @app.post("/v1/messages")
 async def anthropic_messages(request: Request):
     try:
@@ -132,23 +140,21 @@ async def anthropic_messages(request: Request):
         })
 
     requested_label = payload.get("model", "")
-
-    print(f"\n{'='*50}")
-    print(f"[Anthropic] Incoming request for model: '{requested_label}'")
+    logger.info(f"[{_req_id(request)}] [Anthropic] Incoming request for model: '{requested_label}'")
 
     if "thinking" in payload:
-        print(f"  -> Stripping 'thinking' field")
+        logger.debug("Stripping 'thinking' field")
         del payload["thinking"]
     if "context_management" in payload:
-        print(f"  -> Stripping 'context_management' field")
+        logger.debug("Stripping 'context_management' field")
         del payload["context_management"]
     if "output_config" in payload:
-        print(f"  -> Stripping 'output_config' field")
+        logger.debug("Stripping 'output_config' field")
         del payload["output_config"]
 
     model_obj = _resolve_model(requested_label)
     if model_obj is None:
-        print(f"Rejected: Model '{requested_label}' is not recognized.")
+        logger.warning(f"Rejected: Model '{requested_label}' is not recognized.")
         return JSONResponse(status_code=400, content={
             "type": "error",
             "error": {"type": "invalid_request_error", "message": f"Model '{requested_label}' not recognized."}
@@ -165,7 +171,7 @@ async def anthropic_messages(request: Request):
         if key in openai_payload:
             del openai_payload[key]
 
-    print(f"[Anthropic] Translated to OpenAI format, proxying to {backend}...")
+    logger.info(f"[{_req_id(request)}] [Anthropic] Proxying {requested_label} to {backend}")
 
     headers = {
         "Authorization": f"Bearer {backend_key}",
@@ -178,34 +184,39 @@ async def anthropic_messages(request: Request):
     try:
         if is_stream:
             openai_payload["stream"] = True
-            upstream_req = _post_with_retry(
-                f"{backend_url}/chat/completions",
-                openai_payload,
-                headers,
-                stream=True,
-                timeout=(25, 600)
-            )
-
-            if upstream_req.status_code != 200:
-                err_text = upstream_req.text
-                print(f"Upstream error ({upstream_req.status_code}): {err_text}")
-                return JSONResponse(status_code=upstream_req.status_code, content={
+            try:
+                resp = await _async_post_stream(
+                    f"{backend_url}/chat/completions",
+                    openai_payload,
+                    headers,
+                )
+            except httpx.RequestError as e:
+                logger.error(f"[Anthropic] Upstream connection failed: {e}")
+                return JSONResponse(status_code=502, content={
                     "type": "error",
-                    "error": {"type": "api_error", "message": err_text}
+                    "error": {"type": "api_error", "message": str(e)}
                 })
 
-            def anthropic_stream_generator():
-                print("Streaming Anthropic-format response back to Claude Code...")
+            if resp.status_code != 200:
+                err_text = await resp.aread()
+                logger.error(f"[Anthropic] Upstream error ({resp.status_code}): {err_text}")
+                return JSONResponse(status_code=resp.status_code, content={
+                    "type": "error",
+                    "error": {"type": "api_error", "message": err_text.decode() if isinstance(err_text, bytes) else str(err_text)}
+                })
+
+            async def anthropic_stream_generator():
+                logger.info("[Anthropic] Streaming response back")
                 is_first = True
-                stream_ended = False
                 try:
-                    for line in upstream_req.iter_lines():
+                    async for line in resp.aiter_lines():
+                        if await request.is_disconnected():
+                            return
                         if not line:
                             continue
-                        decoded = line.decode('utf-8')
-                        if not decoded.startswith("data: "):
+                        if not line.startswith("data: "):
                             continue
-                        data_str = decoded[6:].strip()
+                        data_str = line[6:].strip()
                         if data_str == "[DONE]":
                             break
                         try:
@@ -217,13 +228,11 @@ async def anthropic_messages(request: Request):
                                 yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode('utf-8')
                         except (json.JSONDecodeError, IndexError, KeyError):
                             continue
+                    yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n".encode('utf-8')
                 finally:
-                    if not stream_ended:
-                        yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n".encode('utf-8')
-                    upstream_req.close()
+                    await resp.aclose()
 
             return StreamingResponse(anthropic_stream_generator(), media_type="text/event-stream")
-
         else:
             openai_payload["stream"] = False
             response = _post_with_retry(f"{backend_url}/chat/completions", openai_payload, headers)
@@ -234,17 +243,12 @@ async def anthropic_messages(request: Request):
                 })
             anthropic_resp = _openai_response_to_anthropic(response.json(), requested_label)
             return JSONResponse(content=anthropic_resp)
-
     except Exception as e:
-        print(f"CRITICAL ERROR during Anthropic proxying:")
-        traceback.print_exc()
+        logger.exception(f"[Anthropic] Critical error")
         return JSONResponse(status_code=500, content={
             "type": "error",
             "error": {"type": "api_error", "message": str(e)}
         })
-
-
-# ---- Gemini API (for Antigravity) ----
 
 @app.get("/v1beta/models")
 async def gemini_list_models():
@@ -257,7 +261,6 @@ async def gemini_list_models():
             "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]
         })
     return {"models": models}
-
 
 @app.api_route("/v1beta/models/{model_path:path}", methods=["GET", "POST"])
 async def gemini_router(request: Request, model_path: str):
@@ -273,7 +276,6 @@ async def gemini_router(request: Request, model_path: str):
             "error": {"code": 400, "message": "Unknown action in path", "status": "INVALID_ARGUMENT"}
         })
 
-
 async def gemini_generate_content(request: Request, model_path: str, stream=False):
     try:
         payload = await request.json()
@@ -285,17 +287,16 @@ async def gemini_generate_content(request: Request, model_path: str, stream=Fals
     model_label = model_path.split("/models/")[-1] if "/models/" in model_path else model_path
     model_label = model_label.split(":")[0]
 
-    print(f"\n{'='*50}")
-    print(f"[Gemini] Incoming request for model: '{model_label}'")
+    req_id = _req_id(request)
+    logger.info(f"[{req_id}] [Gemini] Incoming request for model: '{model_label}'")
 
     model_obj = _resolve_model(model_label)
     if model_obj is None:
-        print(f"[Gemini] Model '{model_label}' not found. Attempting fallback routing...")
+        logger.info(f"[{_req_id(request)}] [Gemini] Model '{model_label}' not found. Attempting fallback routing...")
         fallback_obj = None
         lower_label = model_label.lower()
         if not MODEL_MAP:
             return JSONResponse(status_code=500, content={"error": {"code": 500, "message": "No models available", "status": "INTERNAL"}})
-
         for k, v in MODEL_MAP.items():
             k_lower = k.lower()
             if ("claude" in lower_label and "claude" in k_lower) or \
@@ -303,11 +304,9 @@ async def gemini_generate_content(request: Request, model_path: str, stream=Fals
                ("gpt" in lower_label and "gpt" in k_lower):
                 fallback_obj = v
                 break
-
         if not fallback_obj:
             fallback_obj = next(iter(MODEL_MAP.values()))
-
-        print(f"  -> Routed '{model_label}' to fallback bridge model: '{fallback_obj['id']}'")
+        logger.info(f"  -> Routed '{model_label}' to fallback: '{fallback_obj['id']}'")
         model_obj = fallback_obj
 
     backend = model_obj["backend"]
@@ -321,7 +320,7 @@ async def gemini_generate_content(request: Request, model_path: str, stream=Fals
         if key in openai_payload:
             del openai_payload[key]
 
-    print(f"[Gemini] Translated to OpenAI format, proxying to {backend}...")
+    logger.info(f"[{_req_id(request)}] [Gemini] Proxying {model_label} to {backend}")
 
     headers = {
         "Authorization": f"Bearer {backend_key}",
@@ -331,32 +330,37 @@ async def gemini_generate_content(request: Request, model_path: str, stream=Fals
     try:
         if stream:
             openai_payload["stream"] = True
-            upstream_req = _post_with_retry(
-                f"{backend_url}/chat/completions",
-                openai_payload,
-                headers,
-                stream=True,
-                timeout=(25, 600)
-            )
-
-            if upstream_req.status_code != 200:
-                err_text = upstream_req.text
-                print(f"[Gemini] Upstream error ({upstream_req.status_code}): {err_text}")
-                return JSONResponse(status_code=upstream_req.status_code, content={
-                    "error": {"code": upstream_req.status_code, "message": err_text, "status": "UPSTREAM_ERROR"}
+            try:
+                resp = await _async_post_stream(
+                    f"{backend_url}/chat/completions",
+                    openai_payload,
+                    headers,
+                )
+            except httpx.RequestError as e:
+                logger.error(f"[Gemini] Upstream connection failed: {e}")
+                return JSONResponse(status_code=502, content={
+                    "error": {"code": 502, "message": str(e), "status": "UPSTREAM_ERROR"}
                 })
 
-            def gemini_stream_generator():
-                print("[Gemini] Streaming response back to Antigravity...")
+            if resp.status_code != 200:
+                err_text = await resp.aread()
+                logger.error(f"[Gemini] Upstream error ({resp.status_code}): {err_text}")
+                return JSONResponse(status_code=resp.status_code, content={
+                    "error": {"code": resp.status_code, "message": err_text.decode() if isinstance(err_text, bytes) else str(err_text), "status": "UPSTREAM_ERROR"}
+                })
+
+            async def gemini_stream_generator():
+                logger.info("[Gemini] Streaming response back")
                 msg_id = f"msg_{uuid.uuid4().hex[:24]}"
                 try:
-                    for line in upstream_req.iter_lines():
+                    async for line in resp.aiter_lines():
+                        if await request.is_disconnected():
+                            return
                         if not line:
                             continue
-                        decoded = line.decode('utf-8')
-                        if not decoded.startswith("data: "):
+                        if not line.startswith("data: "):
                             continue
-                        data_str = decoded[6:].strip()
+                        data_str = line[6:].strip()
                         if data_str == "[DONE]":
                             break
                         try:
@@ -366,33 +370,26 @@ async def gemini_generate_content(request: Request, model_path: str, stream=Fals
                                 yield f"data: {json.dumps(gemini_chunk)}\n\n".encode('utf-8')
                         except (json.JSONDecodeError, IndexError, KeyError):
                             continue
-                finally:
                     yield b"data: [DONE]\n\n"
-                    upstream_req.close()
+                finally:
+                    await resp.aclose()
 
             return StreamingResponse(gemini_stream_generator(), media_type="text/event-stream")
-
         else:
             openai_payload["stream"] = False
             response = _post_with_retry(f"{backend_url}/chat/completions", openai_payload, headers)
             if response.status_code != 200:
-                print(f"[Gemini] Upstream error ({response.status_code}): {response.text}")
+                logger.error(f"[Gemini] Upstream error ({response.status_code}): {response.text}")
                 return JSONResponse(status_code=response.status_code, content={
                     "error": {"code": response.status_code, "message": response.text, "status": "UPSTREAM_ERROR"}
                 })
             gemini_resp = _openai_to_gemini_response(response.json(), model_label)
-            print("[Gemini] Non-streaming response sent.")
             return JSONResponse(content=gemini_resp)
-
     except Exception as e:
-        print(f"[Gemini] CRITICAL ERROR:")
-        traceback.print_exc()
+        logger.exception(f"[Gemini] Critical error")
         return JSONResponse(status_code=500, content={
             "error": {"code": 500, "message": str(e), "status": "INTERNAL_ERROR"}
         })
-
-
-# ---- Responses API (for Codex CLI) ----
 
 @app.post("/v1/responses")
 async def responses_create(request: Request):
@@ -404,13 +401,11 @@ async def responses_create(request: Request):
         })
 
     requested_label = payload.get("model", "")
-
-    print(f"\n{'='*50}")
-    print(f"[Responses] Incoming request for model: '{requested_label}'")
+    logger.info(f"[{_req_id(request)}] [Responses] Incoming request for model: '{requested_label}'")
 
     model_obj = _resolve_model(requested_label)
     if model_obj is None:
-        print(f"[Responses] Rejected: Model '{requested_label}' is not recognized.")
+        logger.warning(f"[Responses] Rejected: Model '{requested_label}' not recognized.")
         return JSONResponse(status_code=400, content={
             "error": {"message": f"Model '{requested_label}' not recognized.", "type": "invalid_request_error"}
         })
@@ -426,7 +421,7 @@ async def responses_create(request: Request):
         if key in openai_payload:
             del openai_payload[key]
 
-    print(f"[Responses] Translated to OpenAI format, proxying to {backend}...")
+    logger.info(f"[{_req_id(request)}] [Responses] Proxying {requested_label} to {backend}")
 
     headers = {
         "Authorization": f"Bearer {backend_key}",
@@ -439,32 +434,37 @@ async def responses_create(request: Request):
     try:
         if is_stream:
             openai_payload["stream"] = True
-            upstream_req = _post_with_retry(
-                f"{backend_url}/chat/completions",
-                openai_payload,
-                headers,
-                stream=True,
-                timeout=(25, 600)
-            )
-
-            if upstream_req.status_code != 200:
-                err_text = upstream_req.text
-                print(f"[Responses] Upstream error ({upstream_req.status_code}): {err_text}")
-                return JSONResponse(status_code=upstream_req.status_code, content={
-                    "error": {"message": err_text, "type": "api_error"}
+            try:
+                resp = await _async_post_stream(
+                    f"{backend_url}/chat/completions",
+                    openai_payload,
+                    headers,
+                )
+            except httpx.RequestError as e:
+                logger.error(f"[Responses] Upstream connection failed: {e}")
+                return JSONResponse(status_code=502, content={
+                    "error": {"message": str(e), "type": "api_error"}
                 })
 
-            def responses_stream_generator():
-                print("[Responses] Streaming response back to Codex CLI...")
+            if resp.status_code != 200:
+                err_text = await resp.aread()
+                logger.error(f"[Responses] Upstream error ({resp.status_code}): {err_text}")
+                return JSONResponse(status_code=resp.status_code, content={
+                    "error": {"message": err_text.decode() if isinstance(err_text, bytes) else str(err_text), "type": "api_error"}
+                })
+
+            async def responses_stream_generator():
+                logger.info("[Responses] Streaming response back")
                 is_first = True
                 try:
-                    for line in upstream_req.iter_lines():
+                    async for line in resp.aiter_lines():
+                        if await request.is_disconnected():
+                            return
                         if not line:
                             continue
-                        decoded = line.decode('utf-8')
-                        if not decoded.startswith("data: "):
+                        if not line.startswith("data: "):
                             continue
-                        data_str = decoded[6:].strip()
+                        data_str = line[6:].strip()
                         if data_str == "[DONE]":
                             break
                         try:
@@ -476,60 +476,53 @@ async def responses_create(request: Request):
                                 yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode('utf-8')
                         except (json.JSONDecodeError, IndexError, KeyError):
                             continue
-                finally:
                     yield b"data: [DONE]\n\n"
-                    upstream_req.close()
+                finally:
+                    await resp.aclose()
 
             return StreamingResponse(responses_stream_generator(), media_type="text/event-stream")
-
         else:
             openai_payload["stream"] = False
             response = _post_with_retry(f"{backend_url}/chat/completions", openai_payload, headers)
             if response.status_code != 200:
-                print(f"[Responses] Upstream error ({response.status_code}): {response.text}")
+                logger.error(f"[Responses] Upstream error ({response.status_code}): {response.text}")
                 return JSONResponse(status_code=response.status_code, content={
                     "error": {"message": response.text, "type": "api_error"}
                 })
             responses_resp = _openai_to_responses_response(response.json())
-            print("[Responses] Non-streaming response sent.")
             return JSONResponse(content=responses_resp)
-
     except Exception as e:
-        print(f"[Responses] CRITICAL ERROR:")
-        traceback.print_exc()
+        logger.exception(f"[Responses] Critical error")
         return JSONResponse(status_code=500, content={
             "error": {"message": str(e), "type": "api_error"}
         })
-
-
-# ---- OpenAI Chat Completions (for all tools) ----
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     payload = await request.json()
     requested_label = payload.get("model")
 
-    print(f"\n{'='*50}")
-    print(f"Incoming request for model: '{requested_label}'")
+    logger.info(f"[{_req_id(request)}] [Chat] Incoming request for model: '{requested_label}'")
 
     model_obj = _resolve_model(requested_label)
     if model_obj is None:
-        print(f"Rejected: Model '{requested_label}' is not recognized.")
+        logger.warning(f"Rejected: Model '{requested_label}' not recognized.")
         return JSONResponse(status_code=400, content={"error": f"Model '{requested_label}' not recognized."})
     backend = model_obj["backend"]
     actual_model_id = model_obj["id"]
     backend_url = BACKENDS[backend]["url"]
     backend_key = BACKENDS[backend]["key"]
 
-    print(f"Translating label to ID: '{actual_model_id}' via {backend} API")
+    logger.info(f"[{_req_id(request)}] Translating label to ID: '{actual_model_id}' via {backend} API")
     payload["model"] = actual_model_id
+    payload = _normalize_openai_messages(payload)
 
     for key in STRIP_PARAMS_BY_BACKEND.get(backend, []):
         if key in payload:
-            print(f"    -> Stripping unsupported param '{key}' for backend {backend}")
+            logger.debug(f"Stripping unsupported param '{key}' for backend {backend}")
             del payload[key]
 
-    print(f"Proxying request directly to {backend_url} ...")
+    logger.info(f"[{_req_id(request)}] Proxying to {backend_url}")
 
     headers = {
         "Authorization": f"Bearer {backend_key}",
@@ -540,109 +533,84 @@ async def chat_completions(request: Request):
         is_stream = payload.get("stream", False)
 
         if is_stream:
-            upstream_req = _post_with_retry(
-                f"{backend_url}/chat/completions",
-                payload,
-                headers,
-                stream=True,
-                timeout=(25, 600)
-            )
+            try:
+                resp = await _async_post_stream(
+                    f"{backend_url}/chat/completions",
+                    payload,
+                    headers,
+                )
+            except httpx.RequestError as e:
+                logger.error(f"Upstream connection failed: {e}")
+                return JSONResponse(status_code=502, content={"error": str(e)})
 
-            if upstream_req.status_code != 200:
-                err_text = upstream_req.text
-                print(f"Upstream error ({upstream_req.status_code}): {err_text}")
-                return JSONResponse(status_code=upstream_req.status_code, content={"error": err_text})
+            if resp.status_code != 200:
+                err_text = await resp.aread()
+                logger.error(f"Upstream error ({resp.status_code}): {err_text}")
+                return JSONResponse(status_code=resp.status_code, content={
+                    "error": err_text.decode() if isinstance(err_text, bytes) else str(err_text)
+                })
 
-            def stream_generator():
-                print("Streaming response back (with strict validation)...")
+            async def stream_generator():
                 first_chunk_sent = False
                 stream_ended_cleanly = False
-
                 stream_id = f"chatcmpl-bridge-{int(time.time())}"
                 stream_created = int(time.time())
-
                 try:
-                    for line in upstream_req.iter_lines():
+                    async for line in resp.aiter_lines():
+                        if await request.is_disconnected():
+                            return
                         if not line:
                             yield b"\n"
                             continue
-
-                        decoded_line = line.decode('utf-8')
-                        if not decoded_line.startswith("data: "):
-                            yield line + b"\n"
+                        if not line.startswith("data: "):
+                            yield line.encode('utf-8') + b"\n"
                             continue
-
-                        data_str = decoded_line[6:]
-
+                        data_str = line[6:]
                         if data_str.strip() == "[DONE]":
-                            print("  [STREAM] End of stream received [DONE]")
                             stream_ended_cleanly = True
                             yield b"data: [DONE]\n\n"
                             break
-
                         try:
                             chunk_json = json.loads(data_str)
-                            print(f"  [RAW] {data_str[:120]}...")
-
                             if not chunk_json.get("choices") or len(chunk_json["choices"]) == 0:
-                                print("    -> Skipping bad chunk: 'choices' array is empty")
                                 continue
-
                             choice = chunk_json["choices"][0]
                             if "delta" not in choice:
                                 choice["delta"] = {}
-
                             chunk_json["id"] = stream_id
                             chunk_json["created"] = stream_created
                             chunk_json["object"] = "chat.completion.chunk"
                             chunk_json["model"] = requested_label
-
                             if not first_chunk_sent:
                                 if "role" not in choice["delta"]:
-                                    print("    -> Injecting 'role': 'assistant' into first chunk")
                                     choice["delta"]["role"] = "assistant"
                                 first_chunk_sent = True
                             else:
                                 if "role" in choice["delta"]:
                                     del choice["delta"]["role"]
-
-                            fixed_data_str = json.dumps(chunk_json)
-                            print(f"  [FIX] {fixed_data_str[:120]}...")
-
-                            yield f"data: {fixed_data_str}\n\n".encode('utf-8')
-
+                            yield f"data: {json.dumps(chunk_json)}\n\n".encode('utf-8')
                         except json.JSONDecodeError:
-                            print(f"  [ERR] Failed to parse JSON: {data_str}")
-                            yield line + b"\n\n"
+                            yield line.encode('utf-8') + b"\n\n"
                         except Exception as e:
-                            print(f"  [ERR] Exception during chunk processing: {e}")
-                            yield line + b"\n\n"
-                finally:
+                            logger.debug(f"Chunk processing error: {e}")
+                            yield line.encode('utf-8') + b"\n\n"
                     if not stream_ended_cleanly:
-                        print("Upstream closed without sending [DONE]")
                         yield b"data: [DONE]\n\n"
-                    upstream_req.close()
+                finally:
+                    await resp.aclose()
 
             return StreamingResponse(stream_generator(), media_type="text/event-stream")
-
         else:
             response = _post_with_retry(f"{backend_url}/chat/completions", payload, headers)
             if response.status_code != 200:
-                print(f"Upstream error ({response.status_code}): {response.text}")
+                logger.error(f"Upstream error ({response.status_code}): {response.text}")
                 return JSONResponse(status_code=response.status_code, content={"error": response.text})
-
-            print("Response successfully retrieved!")
             resp_json = response.json()
             resp_json["model"] = requested_label
             return JSONResponse(content=resp_json)
-
     except Exception as e:
-        print(f"CRITICAL ERROR during proxying:")
-        traceback.print_exc()
+        logger.exception(f"Critical error during proxying")
         return JSONResponse(status_code=500, content={"error": str(e)})
-
-
-# ---- Config Generation (orchestration) ----
 
 def generate_opencode_config(selected_models=None, do_test=False, top_n=None, targets=None):
     global MODEL_MAP, CLAUDE_MODEL_MAP, ACTIVE_MODELS
@@ -659,7 +627,7 @@ def generate_opencode_config(selected_models=None, do_test=False, top_n=None, ta
     else:
         all_models = get_all_models()
         if not all_models:
-            print("No models fetched. Cannot generate config.")
+            logger.error("No models fetched. Cannot generate config.")
             return
         for m in all_models:
             MODEL_MAP[m["label"]] = m
@@ -675,51 +643,48 @@ def generate_opencode_config(selected_models=None, do_test=False, top_n=None, ta
         if top_n == -1:
             g4f_top = [m for m in all_models if m["backend"] == "G4F"][:15]
             eaon_top = [m for m in all_models if m["backend"] == "EAON" and m.get("tier") == "plus"]
-            print(f"Selecting Top 15 models from G4F and ALL {len(eaon_top)} plus-tier models from EAON.")
+            pa_models = [m for m in all_models if m["backend"] == "PA"]
+            logger.info(f"Selecting Top 15 G4F models, {len(eaon_top)} EAON plus-tier, and {len(pa_models)} PA models.")
         else:
             g4f_top = [m for m in all_models if m["backend"] == "G4F"][:top_n]
             eaon_top = [m for m in all_models if m["backend"] == "EAON" and m.get("tier") == "plus"][:top_n]
-            print(f"Selecting Top {top_n} models from G4F and Top {top_n} plus-tier models from EAON.")
-        pre_test_models = g4f_top + eaon_top
+            pa_models = [m for m in all_models if m["backend"] == "PA"][:top_n]
+            logger.info(f"Selecting Top {top_n} G4F, {top_n} EAON plus-tier, and {top_n} PA models.")
+        pre_test_models = g4f_top + eaon_top + pa_models
     else:
         pre_test_models = all_models
 
     final_models = []
     if do_test:
-        print("\nRunning live tests on selected models...")
+        logger.info("\nRunning live tests on selected models...")
         for m in pre_test_models:
             if test_model_live(m):
                 final_models.append(m)
-        print(f"{len(final_models)} out of {len(pre_test_models)} passed the test.")
+        logger.info(f"{len(final_models)} out of {len(pre_test_models)} passed testing.")
     else:
         final_models = pre_test_models
 
     if not final_models:
-        print("No valid models to save. Exiting.")
+        logger.error("No valid models to save. Exiting.")
         sys.exit(1)
 
     ACTIVE_MODELS.clear()
     for m in final_models:
         ACTIVE_MODELS.add(m["label"])
 
-    print(f"Saving {len(final_models)} models...")
+    logger.info(f"Saving {len(final_models)} models...")
 
     if targets is None:
         targets = ["opencode"]
 
-    has_conflicts = False
     for target in targets:
         if target == "opencode":
             continue
         conflicts = _detect_config_conflicts(target, final_models)
         if conflicts:
-            has_conflicts = True
-            print(f"\nConflict detection for {target}:")
+            logger.info(f"Conflict detection for {target}:")
             for c in conflicts:
-                print(c)
-
-    if has_conflicts:
-        print()
+                logger.info(c)
 
     target_map = {
         "opencode": opencode,
@@ -734,80 +699,39 @@ def generate_opencode_config(selected_models=None, do_test=False, top_n=None, ta
         if module:
             module.write_config(final_models, top_n if target == "opencode" else None)
 
-
-# ---- TUI Launch ----
-
-TUI_SCREEN_COMMANDS = {"setup", "config", "dashboard", "logs", "models"}
-CLI_FLAGS = {"-l", "--list", "-m", "--model", "-t", "--test", "-b", "--best", "-s", "--setup", "--target"}
-
-
-def _launch_tui(extra_args=None):
-    import subprocess
-    from pathlib import Path
-
-    bridge_dir = Path(__file__).resolve().parents[2]
-    tui_dist = bridge_dir / "tui" / "dist" / "index.js"
-    if not tui_dist.exists():
-        print("TUI not built. Run: cd tui && npm run build")
-        sys.exit(1)
-
-    cmd = ["node", str(tui_dist)] + (extra_args or [])
-    result = subprocess.run(cmd)
-    sys.exit(result.returncode)
-
-
-def _has_cli_flags():
-    """Check if sys.argv contains any Python CLI flags."""
-    for arg in sys.argv[1:]:
-        if arg in CLI_FLAGS or arg.startswith("-"):
-            return True
-    return False
-
-
-def _is_tui_command():
-    """Check if sys.argv[1] is a TUI screen command."""
-    if len(sys.argv) > 1 and sys.argv[1] in TUI_SCREEN_COMMANDS:
-        return True
-    return False
-
-
-# ---- CLI Entry Point ----
-
 def cli_main():
-    if _is_tui_command():
-        _launch_tui(sys.argv[2:])
+    setup_logging()
 
-    if _has_cli_flags():
-        _run_python_cli()
-        return
-
-    if len(sys.argv) > 1:
-        _launch_tui(sys.argv[1:])
-
-    _launch_tui()
-
-
-def _run_python_cli():
-    parser = argparse.ArgumentParser(description="G4F/EAON Bridge with multi-tool config generation")
+    parser = argparse.ArgumentParser(
+        description="G4F Bridge - Multi-tool API bridge for G4F, EAON, and PA proxy networks",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument("--keys", action="store_true",
+                        help="Manage API keys (G4F, EAON)")
     parser.add_argument("-l", "--list", nargs='?', const=-1, default=None, type=int,
-                        help="List models from all proxies. Optionally limit count (e.g. -l 10)")
-    parser.add_argument("-m", "--model", type=str, nargs="+", help="Search for models matching one or more terms (e.g. -m gpt deepseek)")
-    parser.add_argument("-t", "--test", action="store_true", help="Test the selected models before adding them")
-    parser.add_argument("-b", "--best", nargs='?', const=-1, default=None, type=int, help="Extract top N models from G4F (defaults to 15) and plus-tier models from EAON")
-    parser.add_argument("-s", "--setup", action="store_true", help="Run the API key setup wizard to update keys")
+                        help="List models from all providers. Optionally limit count (e.g. -l 10)")
+    parser.add_argument("-m", "--model", type=str, nargs="+",
+                        help="Search for models matching terms (e.g. -m gpt deepseek)")
+    parser.add_argument("-t", "--test", action="store_true",
+                        help="Test selected models before adding them")
+    parser.add_argument("-b", "--best", nargs='?', const=-1, default=None, type=int,
+                        help="Extract top N G4F models and EAON plus-tier models")
+    parser.add_argument("-s", "--setup", action="store_true",
+                        help="Run API key setup wizard")
     parser.add_argument("--target", nargs="+", choices=TARGET_CHOICES, default=None,
-                        help=f"Target tools to generate configs for (default: opencode). "
-                             f"Choices: {', '.join(TARGET_CHOICES)}. "
-                             f"Use '--target all' to target all tools.")
+                        help=f"Target tools (default: opencode). Choices: {', '.join(TARGET_CHOICES)}")
     args = parser.parse_args()
+
+    if args.keys:
+        manage_keys()
+        return
 
     load_or_prompt_keys(force_setup=args.setup)
 
-    # List-only mode: fetch and print models, then exit
     if args.list is not None:
         all_models = get_all_models()
         if not all_models:
-            print("No models available.")
+            logger.error("No models available.")
             sys.exit(1)
         limit = None if args.list == -1 else args.list
         if limit is not None and limit < len(all_models):
@@ -820,7 +744,7 @@ def _run_python_cli():
             backend_tag = m.get("backend", "?")
             label = m.get("label", m.get("id", "?"))
             display = label.split(":")[-1].split("/")[-1]
-            print(f"  {i:>3}. [{backend_tag}] {display:30s} {m.get('requests', 0):>8,} requests")
+            print(f"  {i:>3}. [{backend_tag}] {display:35s} {m.get('requests', 0):>8,} requests")
         print()
         sys.exit(0)
 
@@ -836,9 +760,9 @@ def _run_python_cli():
             sys.exit(0)
 
     if args.model or args.best is not None or not args.setup:
-        print("Running pre-flight checks...")
-        _run_preflight_checks(targets)
-        print("   All checks passed.\n")
+        if args.model or args.best is not None:
+            logger.info("Running pre-flight checks...")
+            _run_preflight_checks(targets)
 
     if args.model:
         all_models = get_all_models()
@@ -846,15 +770,33 @@ def _run_python_cli():
             sys.exit(1)
         selected = interactive_model_selection(args.model, all_models)
         if not selected:
-            print("No models selected. Exiting.")
+            logger.warning("No models selected. Exiting.")
             sys.exit(0)
         generate_opencode_config(selected_models=selected, do_test=args.test, targets=targets)
-    else:
+    elif args.best is not None:
         generate_opencode_config(top_n=args.best, do_test=args.test, targets=targets)
+    else:
+        all_models = get_all_models()
+        if not all_models:
+            logger.error("No models available from any backend.")
+            sys.exit(1)
+        print(f"\nAvailable models ({len(all_models)} total):\n")
+        for i, m in enumerate(all_models[:30], 1):
+            backend_tag = m.get("backend", "?")
+            label = m.get("label", m.get("id", "?"))
+            display = label.split(":")[-1].split("/")[-1]
+            print(f"  {i:>3}. [{backend_tag}] {display:35s} {m.get('requests', 0):>8,} requests")
+        if len(all_models) > 30:
+            print(f"\n  ... and {len(all_models) - 30} more (use -l to list all)")
+        print()
 
-    print(f"\nStarting Bridge on http://127.0.0.1:{PORT}...")
-    uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="info")
+        logger.info(f"Generating config for {len(all_models)} models")
+        generate_opencode_config(selected_models=all_models, do_test=False, targets=targets)
 
+    print(f"\nStarting Bridge on http://127.0.0.1:{PORT} ...")
+    logger.info(f"Bridge running on http://127.0.0.1:{PORT}")
+    logger.info(f"Concurrent request limit: 50")
+    uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="warning")
 
 if __name__ == "__main__":
     cli_main()

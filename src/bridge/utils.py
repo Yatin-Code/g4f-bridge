@@ -1,17 +1,52 @@
-import json
-import os
-import sys
-import socket
-import shutil
-import platform
+import json, os, sys, socket, shutil, platform, logging, threading, time
+
+logger = logging.getLogger("g4f-bridge")
+request_logger = logging.getLogger("g4f-bridge.requests")
 
 CONFIG_PATH = None
-
 BACKENDS = {}
+
+_ACTIVE_REQUESTS = 0
+_REQUEST_LOCK = threading.Lock()
+_MAX_CONCURRENT = 50
+
+def setup_logging(level=logging.INFO):
+    root = logging.getLogger("g4f-bridge")
+    root.setLevel(logging.DEBUG)
+    if not root.handlers:
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setLevel(level)
+        fmt = logging.Formatter('%(asctime)s %(levelname)-5s %(message)s', datefmt='%H:%M:%S')
+        ch.setFormatter(fmt)
+        root.addHandler(ch)
+        uvicorn_logger = logging.getLogger("uvicorn")
+        uvicorn_logger.handlers.clear()
+        uvicorn_logger.propagate = False
+
+def get_active_requests():
+    with _REQUEST_LOCK:
+        return _ACTIVE_REQUESTS
+
+def increment_requests():
+    global _ACTIVE_REQUESTS
+    with _REQUEST_LOCK:
+        _ACTIVE_REQUESTS += 1
+        return _ACTIVE_REQUESTS
+
+def decrement_requests():
+    global _ACTIVE_REQUESTS
+    with _REQUEST_LOCK:
+        _ACTIVE_REQUESTS = max(0, _ACTIVE_REQUESTS - 1)
+        return _ACTIVE_REQUESTS
+
+def log_request_status():
+    active = get_active_requests()
+    logger.info(f"[CONCURRENT] {active}/{_MAX_CONCURRENT} requests in flight")
 
 STRIP_PARAMS_BY_BACKEND = {
     "G4F": ["parallel_tool_calls"],
     "EAON": ["parallel_tool_calls"],
+    "PA": ["parallel_tool_calls"],
 }
 
 ALL_TARGETS = ["opencode", "claude-code", "codex", "cursor", "antigravity"]
@@ -40,13 +75,11 @@ INSTALL_COMMANDS = {
     },
 }
 
-
 def _get_bridge_config_dir():
     if platform.system() == "Windows":
         base = os.environ.get("APPDATA", os.path.expanduser("~"))
         return os.path.join(base, "g4f-bridge")
     return os.path.join(os.path.expanduser("~"), ".g4f-bridge")
-
 
 def _migrate_old_config():
     old_dir = os.path.join(os.path.expanduser("~"), ".opencode-g4f-bridge")
@@ -56,12 +89,10 @@ def _migrate_old_config():
             os.makedirs(new_dir, exist_ok=True)
             old_keys = os.path.join(old_dir, "keys.json")
             if os.path.exists(old_keys):
-                import shutil
                 shutil.copy2(old_keys, os.path.join(new_dir, "keys.json"))
-                print(f"  -> Migrated config from {old_dir} to {new_dir}")
+                logger.info(f"Migrated config from {old_dir} to {new_dir}")
         except Exception:
             pass
-
 
 def _get_opencode_config_dir():
     xdg = os.environ.get("XDG_CONFIG_HOME")
@@ -69,22 +100,24 @@ def _get_opencode_config_dir():
         return os.path.join(xdg, "opencode")
     return os.path.join(os.path.expanduser("~"), ".config", "opencode")
 
-
 def _get_codex_config_dir():
     return os.path.join(os.path.expanduser("~"), ".codex")
-
 
 def _get_cursor_config_dir():
     return os.path.join(os.path.expanduser("~"), ".cursor")
 
-
 def _get_claude_code_config_dir():
     return os.path.join(os.path.expanduser("~"), ".claude")
-
 
 def _get_antigravity_config_dir():
     return os.path.join(os.path.expanduser("~"), ".gemini")
 
+PROVIDER_DEFAULTS = {
+    "G4F": {"url": "https://g4f.space/v1", "key": ""},
+    "EAON": {"url": "https://api.eaon.dev/v1", "key": ""},
+}
+
+PA_CONFIG = {"url": "https://g4f.space", "providers_path": "/pa/providers"}
 
 def load_or_prompt_keys(force_setup=False):
     global CONFIG_PATH, BACKENDS
@@ -92,7 +125,7 @@ def load_or_prompt_keys(force_setup=False):
     config_dir = _get_bridge_config_dir()
     os.makedirs(config_dir, exist_ok=True)
     CONFIG_PATH = os.path.join(config_dir, "keys.json")
-    keys = {"G4F": "", "EAON": ""}
+    keys = {k: "" for k in PROVIDER_DEFAULTS}
 
     if os.path.exists(CONFIG_PATH):
         try:
@@ -102,44 +135,68 @@ def load_or_prompt_keys(force_setup=False):
         except Exception:
             pass
 
-    needs_save = False
+    keys = {k: v for k, v in keys.items() if k in PROVIDER_DEFAULTS}
 
-    if force_setup or (not keys.get("G4F") and not keys.get("EAON") and not os.path.exists(CONFIG_PATH)):
-        print("G4F/EAON Bridge Setup!")
-        if force_setup:
-            print(f"Current G4F Key: {'[SET]' if keys.get('G4F') else '[NOT SET]'}")
-            print(f"Current EAON Key: {'[SET]' if keys.get('EAON') else '[NOT SET]'}")
-            print("Press ENTER to keep existing key, or type a new one.\n")
-        else:
-            print("Enter your API keys below. Press ENTER to skip a provider.\n")
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r") as f:
+                existing = json.load(f)
+            stale = {k for k in existing if k not in PROVIDER_DEFAULTS}
+            if stale:
+                with open(CONFIG_PATH, "w") as f:
+                    json.dump(keys, f, indent=4)
+                logger.info(f"Cleaned up stale keys: {', '.join(stale)}")
+        except Exception:
+            pass
 
-        g4f = input("Enter your G4F API Key: ").strip()
-        if g4f:
-            keys["G4F"] = g4f
-            needs_save = True
-
-        eaon = input("Enter your EAON API Key: ").strip()
-        if eaon:
-            keys["EAON"] = eaon
-            needs_save = True
-
-        if force_setup and not needs_save:
-            print("No keys updated.")
-
-    if needs_save:
-        with open(CONFIG_PATH, "w") as f:
-            json.dump(keys, f, indent=4)
-        print(f"Keys saved to {CONFIG_PATH}\n")
-
-    if keys.get("G4F"):
-        BACKENDS["G4F"] = {"url": "https://g4f.space/v1", "key": keys["G4F"]}
-    if keys.get("EAON"):
-        BACKENDS["EAON"] = {"url": "https://api.eaon.dev/v1", "key": keys["EAON"]}
-
-    if not BACKENDS:
-        print("No API keys provided. The bridge cannot operate without at least one provider.")
+    if force_setup:
+        print("G4F Bridge - API Key Management\n")
+        try:
+            for provider, defaults in PROVIDER_DEFAULTS.items():
+                current = keys.get(provider, "")
+                display_url = defaults["url"]
+                print(f"  [{provider}] URL: {display_url}")
+                print(f"  [{provider}] Key: {'[SET]' if current else '[NOT SET]'}{' (' + current[:8] + '...)' if current else ''}")
+                val = input(f"  Enter new key for {provider} (or ENTER to keep): ").strip()
+                if val:
+                    keys[provider] = val
+                    changed = True
+                else:
+                    changed = False
+                default_url = PROVIDER_DEFAULTS[provider]["url"]
+                url = input(f"  Enter URL for {provider} (or ENTER for default '{default_url}'): ").strip()
+                if url:
+                    PROVIDER_DEFAULTS[provider]["url"] = url
+                    changed = True
+                if changed:
+                    with open(CONFIG_PATH, "w") as f:
+                        json.dump(keys, f, indent=4)
+                    logger.info(f"  -> {provider} keys saved")
+                print()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(0)
+    elif not any(keys.values()):
+        logger.error("No API keys found. Run: g4f-bridge --keys")
         sys.exit(1)
 
+    for provider, defaults in PROVIDER_DEFAULTS.items():
+        key = keys.get(provider, "")
+        url = PROVIDER_DEFAULTS[provider]["url"]
+        if key:
+            BACKENDS[provider] = {"url": url, "key": key}
+            logger.info(f"Backend '{provider}' configured: {url}")
+    if "G4F" in BACKENDS:
+        BACKENDS["PA"] = {"url": PA_CONFIG["url"], "key": BACKENDS["G4F"]["key"]}
+        logger.info(f"Backend 'PA' configured using G4F key: {PA_CONFIG['url']}")
+
+    if not BACKENDS:
+        logger.error("No API keys provided. The bridge cannot operate without at least one provider.")
+        sys.exit(1)
+
+def manage_keys():
+    setup_logging(logging.WARNING)
+    load_or_prompt_keys(force_setup=True)
 
 def _check_port_in_use(port):
     try:
@@ -148,7 +205,6 @@ def _check_port_in_use(port):
             return s.connect_ex(("127.0.0.1", port)) == 0
     except Exception:
         return False
-
 
 def _check_tool_installed(tool):
     cmd_map = {
@@ -164,7 +220,6 @@ def _check_tool_installed(tool):
     if path:
         return True, path
     return False, cmd
-
 
 def _detect_config_conflicts(target, final_models):
     warnings = []
@@ -250,7 +305,6 @@ def _detect_config_conflicts(target, final_models):
 
     return warnings
 
-
 def _run_preflight_checks(targets):
     for target in targets:
         if target not in INSTALL_COMMANDS:
@@ -258,11 +312,9 @@ def _run_preflight_checks(targets):
         installed, cmd = _check_tool_installed(target)
         if not installed:
             info = INSTALL_COMMANDS[target]
-            print(f"\n{info['name']} ('{cmd}') not found in PATH.")
-            print(f"Install it from: {info['url']}")
-            print(f"\nInstall command:")
-            print(f"  {info['cmd']}")
-            print()
+            logger.warning(f"{info['name']} ('{cmd}') not found in PATH.")
+            logger.info(f"Install from: {info['url']}")
+            logger.info(f"Install command: {info['cmd']}")
             choice = input("Press [y] to install now, or [Enter] to skip: ").strip().lower()
             if choice == 'y':
                 print(f"\nInstalling {info['name']}...\n")
@@ -277,31 +329,30 @@ def _run_preflight_checks(targets):
                         print(f"  {line}", end="")
                     proc.wait()
                     if proc.returncode != 0:
-                        print(f"\nInstall failed (exit code {proc.returncode}).")
-                        print(f"Run manually: {info['cmd']}")
+                        logger.error(f"Install failed (exit code {proc.returncode}).")
+                        logger.info(f"Run manually: {info['cmd']}")
                         sys.exit(1)
                     installed_now, _ = _check_tool_installed(target)
                     if not installed_now:
-                        print(f"\nInstall succeeded but '{cmd}' not found in PATH.")
-                        print(f"Restart your shell or add ~/.local/bin to PATH:")
-                        print(f"  export PATH=\"$HOME/.local/bin:$PATH\"")
+                        logger.error(f"Install succeeded but '{cmd}' not found in PATH.")
+                        logger.info(f"Restart your shell or add ~/.local/bin to PATH:")
+                        logger.info(f"  export PATH=\"$HOME/.local/bin:$PATH\"")
                         sys.exit(1)
-                    print(f"\n{info['name']} installed successfully!\n")
+                    logger.info(f"{info['name']} installed successfully!\n")
                 except subprocess.TimeoutExpired:
-                    print(f"Install timed out.")
+                    logger.error("Install timed out.")
                     sys.exit(1)
                 except Exception as e:
-                    print(f"Install failed: {e}")
+                    logger.error(f"Install failed: {e}")
                     sys.exit(1)
             else:
-                print(f"Skipping. Run manually: {info['cmd']}")
+                logger.info(f"Skipping. Run manually: {info['cmd']}")
                 sys.exit(1)
 
     if _check_port_in_use(1337):
-        print(f"\nPort 1337 is already in use!")
-        print(f"Stop it: lsof -i :1337  (then kill the PID)")
+        logger.error(f"Port 1337 is already in use!")
+        logger.info(f"Stop it: lsof -i :1337  (then kill the PID)")
         sys.exit(1)
-
 
 def _safe_write_json(path, data):
     try:
@@ -314,7 +365,6 @@ def _safe_write_json(path, data):
     except Exception as e:
         return False, str(e)
 
-
 def _safe_write_text(path, data):
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -325,7 +375,6 @@ def _safe_write_text(path, data):
         return False, f"Permission denied writing to {path}"
     except Exception as e:
         return False, str(e)
-
 
 def _safe_read_json(path):
     try:

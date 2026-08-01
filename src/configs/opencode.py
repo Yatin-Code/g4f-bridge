@@ -1,5 +1,5 @@
 import os
-from ..bridge.utils import _get_opencode_config_dir, _safe_write_json
+from ..bridge.utils import _get_opencode_config_dir, _safe_read_json, _safe_write_json
 
 
 def get_display_name(m, top_n=None):
@@ -52,14 +52,38 @@ def _build_config(final_models, top_n=None):
                 "models": chunk
             }
 
+    pa_models = {m["label"]: {"name": m["label"]} for m in final_models if m["backend"] == "PA"}
+    if pa_models:
+        for i, chunk in enumerate(chunk_models(pa_models, 15)):
+            name = "PA" if len(pa_models) <= 15 else f"PA (Page {i+1})"
+            config["provider"][f"pa-bridge-{i}"] = {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": name,
+                "options": {
+                    "baseURL": "http://127.0.0.1:1337/v1",
+                    "apiKey": "dummy_key"
+                },
+                "models": chunk
+            }
+
     return config
 
 
 def write_config(final_models, top_n=None):
     config_dir = _get_opencode_config_dir()
     config_path = os.path.join(config_dir, "opencode.json")
-    config = _build_config(final_models, top_n)
-    ok, err = _safe_write_json(config_path, config)
+
+    existing, err = _safe_read_json(config_path)
+    if err:
+        print(f"OpenCode: Failed to read existing config: {err}")
+        return
+    if not isinstance(existing, dict):
+        print(f"OpenCode: Existing config is not a JSON object, backing it up and overwriting.")
+        existing = {}
+
+    existing["provider"] = _build_config(final_models, top_n)["provider"]
+
+    ok, err = _safe_write_json(config_path, existing)
     if ok:
         print(f"OpenCode: {config_path} successfully updated!")
     else:

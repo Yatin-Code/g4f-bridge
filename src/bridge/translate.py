@@ -1,17 +1,34 @@
-import json
-import time
-import uuid
+import json, time, uuid, logging, asyncio
+
+import httpx
 import requests
 
+logger = logging.getLogger("g4f-bridge.translate")
 
-def _post_with_retry(url, json_payload, headers, stream=False, timeout=None, max_retries=2):
+_async_client = None
+
+def _get_async_client():
+    global _async_client
+    if _async_client is None:
+        limits = httpx.Limits(max_keepalive_connections=20, max_connections=100)
+        _async_client = httpx.AsyncClient(
+            limits=limits,
+            timeout=httpx.Timeout(600.0, connect=25.0, pool=30.0),
+        )
+    return _async_client
+
+async def _async_post_stream(url, json_payload, headers):
+    client = _get_async_client()
+    return await client.post(url, json=json_payload, headers=headers)
+
+def _post_with_retry(url, json_payload, headers, stream=False, timeout=None, max_retries=10):
     last_exc = None
     for attempt in range(max_retries + 1):
         try:
             resp = requests.post(url, json=json_payload, headers=headers, stream=stream, timeout=timeout)
             if resp.status_code in (429, 502, 503, 504) and attempt < max_retries:
                 wait = 1.5 * (attempt + 1)
-                print(f"    -> Upstream returned {resp.status_code}, retrying in {wait:.1f}s (attempt {attempt + 1}/{max_retries})...")
+                logger.warning(f"Upstream returned {resp.status_code}, retrying in {wait:.1f}s (attempt {attempt + 1}/{max_retries})")
                 resp.close()
                 time.sleep(wait)
                 continue
@@ -20,13 +37,37 @@ def _post_with_retry(url, json_payload, headers, stream=False, timeout=None, max
             last_exc = e
             if attempt < max_retries:
                 wait = 1.5 * (attempt + 1)
-                print(f"    -> Request failed ({e}), retrying in {wait:.1f}s (attempt {attempt + 1}/{max_retries})...")
+                logger.warning(f"Request failed ({e}), retrying in {wait:.1f}s (attempt {attempt + 1}/{max_retries})")
                 time.sleep(wait)
                 continue
     if last_exc:
         raise last_exc
     return resp
 
+def _flatten_openai_content(content):
+    if isinstance(content, str) or content is None:
+        return content
+    if isinstance(content, list):
+        text_parts = []
+        for block in content:
+            if isinstance(block, str):
+                text_parts.append(block)
+            elif isinstance(block, dict):
+                if block.get("type") in (None, "text") and "text" in block:
+                    text_parts.append(block.get("text", ""))
+                elif "content" in block:
+                    text_parts.append(str(block.get("content", "")))
+        return " ".join(text_parts)
+    return str(content)
+
+def _normalize_openai_messages(payload):
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return payload
+    for msg in messages:
+        if isinstance(msg, dict) and "content" in msg:
+            msg["content"] = _flatten_openai_content(msg["content"])
+    return payload
 
 def _anthropic_to_openai(payload):
     messages = []
@@ -137,7 +178,6 @@ def _anthropic_to_openai(payload):
 
     return result
 
-
 def _openai_chunk_to_anthropic_events(chunk_json, msg_id, model_name, is_first):
     events = []
     choices = chunk_json.get("choices", [])
@@ -220,7 +260,6 @@ def _openai_chunk_to_anthropic_events(chunk_json, msg_id, model_name, is_first):
 
     return events, is_first
 
-
 def _openai_response_to_anthropic(resp_json, model_name):
     content = []
     choice = resp_json.get("choices", [{}])[0]
@@ -260,7 +299,6 @@ def _openai_response_to_anthropic(resp_json, model_name):
             "output_tokens": usage.get("completion_tokens", 0)
         }
     }
-
 
 def _gemini_to_openai(payload, model_id):
     messages = []
@@ -366,7 +404,6 @@ def _gemini_to_openai(payload, model_id):
 
     return result
 
-
 def _openai_to_gemini_response(resp_json, model_name):
     choice = resp_json.get("choices", [{}])[0]
     message = choice.get("message", {})
@@ -415,7 +452,6 @@ def _openai_to_gemini_response(resp_json, model_name):
                 usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0))
         }
     }
-
 
 def _openai_chunk_to_gemini_chunk(chunk_json, msg_id):
     choices = chunk_json.get("choices", [])
@@ -473,7 +509,6 @@ def _openai_chunk_to_gemini_chunk(chunk_json, msg_id):
         }
 
     return chunk if chunk else None
-
 
 def _responses_to_openai(payload):
     messages = []
@@ -568,7 +603,6 @@ def _responses_to_openai(payload):
 
     return result
 
-
 def _openai_to_responses_response(resp_json):
     choice = resp_json.get("choices", [{}])[0]
     message = choice.get("message", {})
@@ -636,7 +670,6 @@ def _openai_to_responses_response(resp_json):
                 usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0))
         }
     }
-
 
 def _openai_chunk_to_responses_events(chunk_json, resp_id, is_first):
     events = []
