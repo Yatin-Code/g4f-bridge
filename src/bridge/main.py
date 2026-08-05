@@ -590,10 +590,10 @@ async def chat_completions(request: Request):
                                     del choice["delta"]["role"]
                             yield f"data: {json.dumps(chunk_json)}\n\n".encode('utf-8')
                         except json.JSONDecodeError:
-                            yield line.encode('utf-8') + b"\n\n"
+                            continue
                         except Exception as e:
                             logger.debug(f"Chunk processing error: {e}")
-                            yield line.encode('utf-8') + b"\n\n"
+                            continue
                     if not stream_ended_cleanly:
                         yield b"data: [DONE]\n\n"
                 finally:
