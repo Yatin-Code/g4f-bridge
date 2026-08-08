@@ -47,6 +47,8 @@ STRIP_PARAMS_BY_BACKEND = {
     "G4F": ["parallel_tool_calls"],
     "EAON": ["parallel_tool_calls"],
     "PA": ["parallel_tool_calls"],
+    "AGENTROUTER": ["parallel_tool_calls"],
+    "OMNIROUTE": ["parallel_tool_calls"],
 }
 
 ALL_TARGETS = ["opencode", "claude-code", "codex", "cursor", "antigravity"]
@@ -115,6 +117,8 @@ def _get_antigravity_config_dir():
 PROVIDER_DEFAULTS = {
     "G4F": {"url": "https://g4f.space/v1", "key": ""},
     "EAON": {"url": "https://api.eaon.dev/v1", "key": ""},
+    "AGENTROUTER": {"url": "https://agentrouter.org/v1", "key": ""},
+    "OMNIROUTE": {"url": "http://localhost:20128/v1", "key": ""},
 }
 
 PA_CONFIG = {"url": "https://g4f.space", "providers_path": "/pa/providers"}

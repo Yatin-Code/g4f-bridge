@@ -1,4 +1,4 @@
-import json, sys, time, uuid, argparse, logging
+import asyncio, json, sys, time, uuid, argparse, logging
 from datetime import datetime, timezone
 
 import httpx
@@ -23,6 +23,9 @@ from .models import (
 from .translate import (
     _post_with_retry, _async_post_stream,
     _anthropic_to_openai, _normalize_openai_messages,
+    _openai_to_anthropic,
+    _anthropic_response_to_openai,
+    _anthropic_event_to_openai_chunks,
     _openai_chunk_to_anthropic_events,
     _openai_response_to_anthropic,
     _gemini_to_openai,
@@ -37,6 +40,35 @@ from ..configs import opencode, claude_code, codex, cursor, antigravity
 logger = logging.getLogger("g4f-bridge")
 
 PORT = 1337
+
+# Auto-continuation for upstream streams that drop mid-response.
+MAX_STREAM_CONTINUATIONS = 3
+STREAM_CONTINUATION_NUDGE = (
+    "Continue your previous response exactly where it left off. "
+    "Do not repeat any text already written."
+)
+
+# Seconds of upstream silence before sending an SSE keepalive ping to the
+# client (OpenCode et al.) so the connection doesn't appear dead while the
+# upstream model is still thinking (high time-to-first-token models like GLM).
+STREAM_KEEPALIVE_INTERVAL = 5.0
+
+# Sentinel pushed by the upstream reader pump when the httpx stream ends.
+_STREAM_END = object()
+
+def _upstream_error_message(err_text):
+    if isinstance(err_text, bytes):
+        err_text = err_text.decode(errors="replace")
+    try:
+        data = json.loads(err_text)
+    except (json.JSONDecodeError, TypeError):
+        return err_text
+    if isinstance(data, dict):
+        err = data.get("error", data)
+        if isinstance(err, dict):
+            return err.get("message", json.dumps(err))
+        return str(err)
+    return err_text
 
 def _req_id(request):
     return getattr(request.state, 'req_id', '--------')
@@ -59,10 +91,27 @@ async def track_requests(request: Request, call_next):
     log_request_status()
     start = time.time()
     response = await call_next(request)
-    elapsed = time.time() - start
-    decrement_requests()
-    logger.info(f"[{req_id}] {request.method} {request.url.path} completed in {elapsed:.2f}s")
-    log_request_status()
+
+    body_iterator = getattr(response, "body_iterator", None)
+    if body_iterator is None:
+        # Non-streaming response — body already fully rendered.
+        elapsed = time.time() - start
+        decrement_requests()
+        logger.info(f"[{req_id}] {request.method} {request.url.path} completed in {elapsed:.2f}s")
+        log_request_status()
+        return response
+
+    async def counting_body():
+        try:
+            async for chunk in body_iterator:
+                yield chunk
+        finally:
+            elapsed = time.time() - start
+            decrement_requests()
+            logger.info(f"[{req_id}] {request.method} {request.url.path} completed in {elapsed:.2f}s")
+            log_request_status()
+
+    response.body_iterator = counting_body()
     return response
 
 @app.get("/v1/models")
@@ -164,6 +213,10 @@ async def anthropic_messages(request: Request):
     backend_url = BACKENDS[backend]["url"]
     backend_key = BACKENDS[backend]["key"]
 
+    if backend == "AGENTROUTER" and _is_anthropic_model(requested_label):
+        payload["model"] = actual_model_id
+        return await _agentrouter_anthropic_messages(request, payload, requested_label)
+
     openai_payload = _anthropic_to_openai(payload)
     openai_payload["model"] = actual_model_id
 
@@ -199,10 +252,11 @@ async def anthropic_messages(request: Request):
 
             if resp.status_code != 200:
                 err_text = await resp.aread()
+                await resp.aclose()
                 logger.error(f"[Anthropic] Upstream error ({resp.status_code}): {err_text}")
                 return JSONResponse(status_code=resp.status_code, content={
                     "type": "error",
-                    "error": {"type": "api_error", "message": err_text.decode() if isinstance(err_text, bytes) else str(err_text)}
+                    "error": {"type": "api_error", "message": _upstream_error_message(err_text)}
                 })
 
             async def anthropic_stream_generator():
@@ -344,9 +398,10 @@ async def gemini_generate_content(request: Request, model_path: str, stream=Fals
 
             if resp.status_code != 200:
                 err_text = await resp.aread()
+                await resp.aclose()
                 logger.error(f"[Gemini] Upstream error ({resp.status_code}): {err_text}")
                 return JSONResponse(status_code=resp.status_code, content={
-                    "error": {"code": resp.status_code, "message": err_text.decode() if isinstance(err_text, bytes) else str(err_text), "status": "UPSTREAM_ERROR"}
+                    "error": {"code": resp.status_code, "message": _upstream_error_message(err_text), "status": "UPSTREAM_ERROR"}
                 })
 
             async def gemini_stream_generator():
@@ -448,9 +503,10 @@ async def responses_create(request: Request):
 
             if resp.status_code != 200:
                 err_text = await resp.aread()
+                await resp.aclose()
                 logger.error(f"[Responses] Upstream error ({resp.status_code}): {err_text}")
                 return JSONResponse(status_code=resp.status_code, content={
-                    "error": {"message": err_text.decode() if isinstance(err_text, bytes) else str(err_text), "type": "api_error"}
+                    "error": {"message": _upstream_error_message(err_text), "type": "api_error"}
                 })
 
             async def responses_stream_generator():
@@ -497,6 +553,140 @@ async def responses_create(request: Request):
             "error": {"message": str(e), "type": "api_error"}
         })
 
+def _is_anthropic_model(label):
+    lower = label.lower()
+    return "claude" in lower or "opus" in lower
+
+def _agentrouter_anthropic_base_url():
+    return BACKENDS["AGENTROUTER"]["url"].rstrip("/").removesuffix("/v1") + "/v1/messages"
+
+async def _agentrouter_anthropic_chat(request, payload, requested_label):
+    """Proxy an OpenAI chat/completions request to agentrouter's Anthropic endpoint."""
+    anthropic_payload = _openai_to_anthropic(payload)
+    target_url = _agentrouter_anthropic_base_url()
+    headers = {
+        "Authorization": f"Bearer {BACKENDS['AGENTROUTER']['key']}",
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01",
+    }
+    logger.info(f"[{_req_id(request)}] [Chat->Anthropic] Proxying {requested_label} to {target_url}")
+
+    is_stream = payload.get("stream", False)
+    stream_id = f"chatcmpl-bridge-{int(time.time())}"
+    try:
+        if is_stream:
+            anthropic_payload["stream"] = True
+            try:
+                resp = await _async_post_stream(target_url, anthropic_payload, headers)
+            except httpx.RequestError as e:
+                logger.error(f"[Chat->Anthropic] Upstream connection failed: {e}")
+                return JSONResponse(status_code=502, content={"error": str(e)})
+
+            if resp.status_code != 200:
+                err_text = await resp.aread()
+                await resp.aclose()
+                logger.error(f"[Chat->Anthropic] Upstream error ({resp.status_code}): {err_text}")
+                return JSONResponse(status_code=resp.status_code, content={
+                    "error": _upstream_error_message(err_text)
+                })
+
+            async def agentrouter_anthropic_stream_generator():
+                state = {"tool_index": 0}
+                current_data = []
+                try:
+                    async for line in resp.aiter_lines():
+                        if await request.is_disconnected():
+                            return
+                        if not line:
+                            if current_data:
+                                data_str = "".join(current_data)
+                                try:
+                                    event = json.loads(data_str)
+                                    chunks = _anthropic_event_to_openai_chunks(
+                                        event, stream_id, requested_label, state
+                                    )
+                                    for chunk in chunks:
+                                        yield f"data: {json.dumps(chunk)}\n\n".encode('utf-8')
+                                except (json.JSONDecodeError, IndexError, KeyError):
+                                    pass
+                            current_data = []
+                            continue
+                        if line.startswith("data: "):
+                            current_data.append(line[6:])
+                    yield b"data: [DONE]\n\n"
+                finally:
+                    await resp.aclose()
+
+            return StreamingResponse(agentrouter_anthropic_stream_generator(), media_type="text/event-stream")
+        else:
+            anthropic_payload["stream"] = False
+            response = _post_with_retry(target_url, anthropic_payload, headers)
+            if response.status_code != 200:
+                logger.error(f"[Chat->Anthropic] Upstream error ({response.status_code}): {response.text}")
+                return JSONResponse(status_code=response.status_code, content={"error": response.text})
+            openai_resp = _anthropic_response_to_openai(response.json(), requested_label)
+            return JSONResponse(content=openai_resp)
+    except Exception as e:
+        logger.exception("[Chat->Anthropic] Critical error")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+async def _agentrouter_anthropic_messages(request, payload, requested_label):
+    """Pass an Anthropic /v1/messages request through to agentrouter's Anthropic endpoint."""
+    target_url = _agentrouter_anthropic_base_url()
+    headers = {
+        "Authorization": f"Bearer {BACKENDS['AGENTROUTER']['key']}",
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01",
+    }
+    logger.info(f"[{_req_id(request)}] [Anthropic->Anthropic] Pass-through {requested_label} to {target_url}")
+
+    is_stream = payload.get("stream", False)
+    try:
+        if is_stream:
+            try:
+                resp = await _async_post_stream(target_url, payload, headers)
+            except httpx.RequestError as e:
+                logger.error(f"[Anthropic->Anthropic] Upstream connection failed: {e}")
+                return JSONResponse(status_code=502, content={
+                    "type": "error",
+                    "error": {"type": "api_error", "message": str(e)}
+                })
+
+            if resp.status_code != 200:
+                err_text = await resp.aread()
+                await resp.aclose()
+                logger.error(f"[Anthropic->Anthropic] Upstream error ({resp.status_code}): {err_text}")
+                return JSONResponse(status_code=resp.status_code, content={
+                    "type": "error",
+                    "error": {"type": "api_error", "message": _upstream_error_message(err_text)}
+                })
+
+            async def passthrough_stream_generator():
+                try:
+                    async for line in resp.aiter_lines():
+                        if await request.is_disconnected():
+                            return
+                        yield (line + "\n").encode('utf-8')
+                finally:
+                    await resp.aclose()
+
+            return StreamingResponse(passthrough_stream_generator(), media_type="text/event-stream")
+        else:
+            response = _post_with_retry(target_url, payload, headers)
+            if response.status_code != 200:
+                logger.error(f"[Anthropic->Anthropic] Upstream error ({response.status_code}): {response.text}")
+                return JSONResponse(status_code=response.status_code, content={
+                    "type": "error",
+                    "error": {"type": "api_error", "message": response.text}
+                })
+            return JSONResponse(content=response.json())
+    except Exception as e:
+        logger.exception("[Anthropic->Anthropic] Critical error")
+        return JSONResponse(status_code=500, content={
+            "type": "error",
+            "error": {"type": "api_error", "message": str(e)}
+        })
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     payload = await request.json()
@@ -516,6 +706,9 @@ async def chat_completions(request: Request):
     logger.info(f"[{_req_id(request)}] Translating label to ID: '{actual_model_id}' via {backend} API")
     payload["model"] = actual_model_id
     payload = _normalize_openai_messages(payload)
+
+    if backend == "AGENTROUTER" and _is_anthropic_model(requested_label):
+        return await _agentrouter_anthropic_chat(request, payload, requested_label)
 
     for key in STRIP_PARAMS_BY_BACKEND.get(backend, []):
         if key in payload:
@@ -545,59 +738,147 @@ async def chat_completions(request: Request):
 
             if resp.status_code != 200:
                 err_text = await resp.aread()
+                await resp.aclose()
                 logger.error(f"Upstream error ({resp.status_code}): {err_text}")
                 return JSONResponse(status_code=resp.status_code, content={
-                    "error": err_text.decode() if isinstance(err_text, bytes) else str(err_text)
+                    "error": _upstream_error_message(err_text)
                 })
 
             async def stream_generator():
                 first_chunk_sent = False
-                stream_ended_cleanly = False
                 stream_id = f"chatcmpl-bridge-{int(time.time())}"
                 stream_created = int(time.time())
+                accumulated = ""
+                retry_count = 0
+                current_resp = resp
                 try:
-                    async for line in resp.aiter_lines():
-                        if await request.is_disconnected():
-                            return
-                        if not line:
-                            yield b"\n"
-                            continue
-                        if not line.startswith("data: "):
-                            yield line.encode('utf-8') + b"\n"
-                            continue
-                        data_str = line[6:]
-                        if data_str.strip() == "[DONE]":
-                            stream_ended_cleanly = True
-                            yield b"data: [DONE]\n\n"
-                            break
+                    while True:
+                        stream_ended_cleanly = False
                         try:
-                            chunk_json = json.loads(data_str)
-                            if not chunk_json.get("choices") or len(chunk_json["choices"]) == 0:
-                                continue
-                            choice = chunk_json["choices"][0]
-                            if "delta" not in choice:
-                                choice["delta"] = {}
-                            chunk_json["id"] = stream_id
-                            chunk_json["created"] = stream_created
-                            chunk_json["object"] = "chat.completion.chunk"
-                            chunk_json["model"] = requested_label
-                            if not first_chunk_sent:
-                                if "role" not in choice["delta"]:
-                                    choice["delta"]["role"] = "assistant"
-                                first_chunk_sent = True
-                            else:
-                                if "role" in choice["delta"]:
-                                    del choice["delta"]["role"]
-                            yield f"data: {json.dumps(chunk_json)}\n\n".encode('utf-8')
-                        except json.JSONDecodeError:
-                            continue
-                        except Exception as e:
-                            logger.debug(f"Chunk processing error: {e}")
-                            continue
-                    if not stream_ended_cleanly:
-                        yield b"data: [DONE]\n\n"
+                            reads = asyncio.Queue()
+
+                            # Pump: consume the upstream stream without ever being
+                            # cancelled by the keepalive timeout below (cancelling
+                            # wait_for on aiter_lines().__anext__() would close the
+                            # httpcore connection, killing the stream on every ping).
+                            async def _pump():
+                                try:
+                                    async for line in current_resp.aiter_lines():
+                                        await reads.put(line)
+                                except (httpx.RequestError, ConnectionError) as e:
+                                    logger.warning(
+                                        f"[{_req_id(request)}] Stream dropped mid-iteration: {e}"
+                                    )
+                                except Exception as e:
+                                    logger.debug(f"Stream read error: {e}")
+                                finally:
+                                    await reads.put(_STREAM_END)
+
+                            pump_task = asyncio.create_task(_pump())
+                            try:
+                                while True:
+                                    try:
+                                        line = await asyncio.wait_for(
+                                            reads.get(),
+                                            timeout=STREAM_KEEPALIVE_INTERVAL,
+                                        )
+                                    except asyncio.TimeoutError:
+                                        if await request.is_disconnected():
+                                            return
+                                        yield b": ping\n\n"
+                                        continue
+                                    if line is _STREAM_END:
+                                        break
+                                    if await request.is_disconnected():
+                                        return
+                                    if not line:
+                                        continue
+                                    if not line.startswith("data: "):
+                                        yield line.encode('utf-8') + b"\n"
+                                        continue
+                                    data_str = line[6:]
+                                    if data_str.strip() == "[DONE]":
+                                        stream_ended_cleanly = True
+                                        break
+                                    try:
+                                        chunk_json = json.loads(data_str)
+                                        if not chunk_json.get("choices") or len(chunk_json["choices"]) == 0:
+                                            continue
+                                        choice = chunk_json["choices"][0]
+                                        if "delta" not in choice:
+                                            choice["delta"] = {}
+                                        chunk_json["id"] = stream_id
+                                        chunk_json["created"] = stream_created
+                                        chunk_json["object"] = "chat.completion.chunk"
+                                        chunk_json["model"] = requested_label
+                                        if not first_chunk_sent:
+                                            if "role" not in choice["delta"]:
+                                                choice["delta"]["role"] = "assistant"
+                                            first_chunk_sent = True
+                                        else:
+                                            if "role" in choice["delta"]:
+                                                del choice["delta"]["role"]
+                                        delta_content = choice["delta"].get("content")
+                                        delta_text = ""
+                                        if isinstance(delta_content, str):
+                                            delta_text = delta_content
+                                            accumulated += delta_content
+                                        elif isinstance(delta_content, list):
+                                            delta_text = "".join(
+                                                part.get("text", "") if isinstance(part, dict) else str(part)
+                                                for part in delta_content
+                                            )
+                                            accumulated += delta_text
+                                        if delta_text:
+                                            logger.info(
+                                                f"[{_req_id(request)}] [Stream] token: {delta_text!r}"
+                                            )
+                                        yield f"data: {json.dumps(chunk_json)}\n\n".encode('utf-8')
+                                    except json.JSONDecodeError:
+                                        continue
+                                    except Exception as e:
+                                        logger.debug(f"Chunk processing error: {e}")
+                                        continue
+                            finally:
+                                pump_task.cancel()
+                                await asyncio.gather(pump_task, return_exceptions=True)
+                        finally:
+                            await current_resp.aclose()
+
+                        if stream_ended_cleanly:
+                            break
+
+                        if not accumulated or retry_count >= MAX_STREAM_CONTINUATIONS:
+                            break
+
+                        retry_count += 1
+                        logger.info(
+                            f"[{_req_id(request)}] Stream dropped after {len(accumulated)} chars, "
+                            f"retrying continuation attempt {retry_count}/{MAX_STREAM_CONTINUATIONS}"
+                        )
+                        continuation_messages = list(payload.get("messages", []))
+                        continuation_messages.append({"role": "assistant", "content": accumulated})
+                        continuation_messages.append({"role": "user", "content": STREAM_CONTINUATION_NUDGE})
+                        continuation_payload = dict(payload)
+                        continuation_payload["messages"] = continuation_messages
+                        continuation_payload["stream"] = True
+                        try:
+                            current_resp = await _async_post_stream(
+                                f"{backend_url}/chat/completions",
+                                continuation_payload,
+                                headers,
+                            )
+                        except httpx.RequestError as e:
+                            logger.error(f"Continuation request failed: {e}")
+                            break
+                        if current_resp.status_code != 200:
+                            err_text = await current_resp.aread()
+                            logger.error(f"Continuation upstream error ({current_resp.status_code}): {err_text}")
+                            break
+
+                    yield b"data: [DONE]\n\n"
                 finally:
-                    await resp.aclose()
+                    await current_resp.aclose()
 
             return StreamingResponse(stream_generator(), media_type="text/event-stream")
         else:

@@ -17,9 +17,30 @@ def _get_async_client():
         )
     return _async_client
 
-async def _async_post_stream(url, json_payload, headers):
+STREAM_POST_MAX_RETRIES = 10
+
+async def _async_post_stream(url, json_payload, headers, max_retries=STREAM_POST_MAX_RETRIES):
     client = _get_async_client()
-    return await client.post(url, json=json_payload, headers=headers)
+    resp = None
+    for attempt in range(max_retries + 1):
+        try:
+            request = client.build_request("POST", url, json=json_payload, headers=headers)
+            resp = await client.send(request, stream=True)
+        except httpx.RequestError as e:
+            if attempt < max_retries:
+                wait = min(0.5 * (attempt + 1), 2.0)
+                logger.warning(f"Upstream request failed ({e}), retrying in {wait:.1f}s (attempt {attempt + 1}/{max_retries})")
+                await asyncio.sleep(wait)
+                continue
+            raise
+        if resp.status_code in (429, 502, 503, 504) and attempt < max_retries:
+            wait = min(0.5 * (attempt + 1), 2.0)
+            logger.warning(f"Upstream returned {resp.status_code}, retrying in {wait:.1f}s (attempt {attempt + 1}/{max_retries})")
+            await resp.aclose()
+            await asyncio.sleep(wait)
+            continue
+        return resp
+    return resp
 
 def _post_with_retry(url, json_payload, headers, stream=False, timeout=None, max_retries=10):
     last_exc = None
@@ -177,6 +198,236 @@ def _anthropic_to_openai(payload):
         result["tool_choice"] = tool_choice
 
     return result
+
+def _openai_to_anthropic(payload):
+    system_parts = []
+    messages = []
+    for msg in payload.get("messages", []):
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role", "user")
+        content = msg.get("content")
+
+        if role == "system":
+            if isinstance(content, str):
+                if content.strip():
+                    system_parts.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") in (None, "text") and block.get("text"):
+                        system_parts.append(block["text"])
+            continue
+
+        if role == "tool":
+            messages.append({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": msg.get("tool_call_id", ""),
+                    "content": content if isinstance(content, str) else json.dumps(content)
+                }]
+            })
+            continue
+
+        blocks = []
+        if isinstance(content, str):
+            if content:
+                blocks.append({"type": "text", "text": content})
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, str):
+                    blocks.append({"type": "text", "text": block})
+                elif isinstance(block, dict):
+                    btype = block.get("type")
+                    if btype in (None, "text") and block.get("text"):
+                        blocks.append({"type": "text", "text": block["text"]})
+                    elif btype == "image_url":
+                        blocks.append({
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": "image/png", "data": ""}
+                        })
+
+        for tc in msg.get("tool_calls", []):
+            fn = tc.get("function", {})
+            try:
+                args = json.loads(fn.get("arguments", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+            blocks.append({
+                "type": "tool_use",
+                "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:24]}"),
+                "name": fn.get("name", ""),
+                "input": args
+            })
+
+        if blocks:
+            messages.append({"role": role, "content": blocks})
+
+    result = {
+        "model": payload.get("model", ""),
+        "messages": messages,
+        "stream": payload.get("stream", False),
+    }
+
+    if system_parts:
+        result["system"] = " ".join(system_parts)
+    if payload.get("max_tokens"):
+        result["max_tokens"] = payload["max_tokens"]
+    if payload.get("temperature") is not None:
+        result["temperature"] = payload["temperature"]
+    if payload.get("top_p") is not None:
+        result["top_p"] = payload["top_p"]
+    if payload.get("stop"):
+        result["stop_sequences"] = payload["stop"]
+
+    anthropic_tools = []
+    for tool in payload.get("tools", []):
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") == "function":
+            fn = tool.get("function", {})
+            anthropic_tools.append({
+                "name": fn.get("name", ""),
+                "description": fn.get("description", ""),
+                "input_schema": fn.get("parameters", {"type": "object", "properties": {}})
+            })
+    if anthropic_tools:
+        result["tools"] = anthropic_tools
+
+    tc = payload.get("tool_choice")
+    if tc:
+        if isinstance(tc, str):
+            if tc == "required":
+                result["tool_choice"] = {"type": "any"}
+            elif tc == "none":
+                result["tool_choice"] = {"type": "none"}
+            else:
+                result["tool_choice"] = {"type": "auto"}
+        elif isinstance(tc, dict):
+            fn = tc.get("function", {})
+            result["tool_choice"] = {"type": "tool", "name": fn.get("name", "")}
+
+    return result
+
+def _anthropic_response_to_openai(resp_json, model_name):
+    content = []
+    tool_calls = []
+    for block in resp_json.get("content", []):
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            content.append(block.get("text", ""))
+        elif btype == "tool_use":
+            tool_calls.append({
+                "id": block.get("id", f"call_{uuid.uuid4().hex[:24]}"),
+                "type": "function",
+                "function": {
+                    "name": block.get("name", ""),
+                    "arguments": json.dumps(block.get("input", {}))
+                }
+            })
+
+    stop_reason = resp_json.get("stop_reason", "end_turn")
+    finish = "stop"
+    if stop_reason == "tool_use":
+        finish = "tool_calls"
+    elif stop_reason == "max_tokens":
+        finish = "length"
+
+    usage = resp_json.get("usage", {})
+    input_tokens = usage.get("input_tokens", 0)
+    output_tokens = usage.get("output_tokens", 0)
+
+    message = {"role": "assistant", "content": "".join(content) if content else None}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model_name,
+        "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+        "usage": {
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens
+        }
+    }
+
+def _anthropic_event_to_openai_chunks(event, stream_id, model_name, state):
+    chunks = []
+    etype = event.get("type")
+
+    if etype == "message_start":
+        chunks.append({
+            "id": stream_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model_name,
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
+        })
+    elif etype == "content_block_start":
+        cb = event.get("content_block", {})
+        if cb.get("type") == "tool_use":
+            idx = state.get("tool_index", 0)
+            state["tool_id"] = cb.get("id", "")
+            state["active_tool_index"] = idx
+            chunks.append({
+                "id": stream_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model_name,
+                "choices": [{"index": 0, "delta": {"tool_calls": [{
+                    "index": idx,
+                    "id": cb.get("id", ""),
+                    "type": "function",
+                    "function": {"name": cb.get("name", ""), "arguments": ""}
+                }]}, "finish_reason": None}]
+            })
+            state["tool_index"] = idx + 1
+    elif etype == "content_block_delta":
+        delta = event.get("delta", {})
+        dtype = delta.get("type")
+        if dtype == "text_delta":
+            chunks.append({
+                "id": stream_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model_name,
+                "choices": [{"index": 0, "delta": {"content": delta.get("text", "")}, "finish_reason": None}]
+            })
+        elif dtype == "input_json_delta":
+            idx = state.get("active_tool_index", 0)
+            chunks.append({
+                "id": stream_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model_name,
+                "choices": [{"index": 0, "delta": {"tool_calls": [{
+                    "index": idx,
+                    "id": state.get("tool_id", ""),
+                    "type": "function",
+                    "function": {"name": None, "arguments": delta.get("partial_json", "")}
+                }]}, "finish_reason": None}]
+            })
+    elif etype == "message_delta":
+        stop_reason = event.get("delta", {}).get("stop_reason")
+        finish = "stop"
+        if stop_reason == "tool_use":
+            finish = "tool_calls"
+        elif stop_reason == "max_tokens":
+            finish = "length"
+        chunks.append({
+            "id": stream_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model_name,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]
+        })
+
+    return chunks
 
 def _openai_chunk_to_anthropic_events(chunk_json, msg_id, model_name, is_first):
     events = []
