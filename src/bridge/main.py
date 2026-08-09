@@ -26,6 +26,7 @@ from .translate import (
     _openai_to_anthropic,
     _anthropic_response_to_openai,
     _anthropic_event_to_openai_chunks,
+    _chunk_text,
     _openai_chunk_to_anthropic_events,
     _openai_response_to_anthropic,
     _gemini_to_openai,
@@ -818,7 +819,9 @@ async def chat_completions(request: Request):
                                         else:
                                             if "role" in choice["delta"]:
                                                 del choice["delta"]["role"]
-                                        delta_content = choice["delta"].get("content")
+                                        delta_content = _chunk_text(choice)
+                                        if delta_content is not None and not choice["delta"].get("content"):
+                                            choice["delta"]["content"] = delta_content
                                         delta_text = ""
                                         if isinstance(delta_content, str):
                                             delta_text = delta_content

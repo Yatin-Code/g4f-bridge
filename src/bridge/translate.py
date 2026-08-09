@@ -199,6 +199,18 @@ def _anthropic_to_openai(payload):
 
     return result
 
+def _chunk_text(choice):
+    """Text from an OpenAI stream choice: delta.content, message.content,
+    or reasoning_content (GLM/thinking models stream output there with
+    content=null; some proxies put the full message in `message`)."""
+    delta = choice.get("delta") or {}
+    content = delta.get("content")
+    if content is None:
+        content = (choice.get("message") or {}).get("content")
+    if not content:
+        content = delta.get("reasoning_content")
+    return content
+
 def _openai_to_anthropic(payload):
     system_parts = []
     messages = []
@@ -437,6 +449,7 @@ def _openai_chunk_to_anthropic_events(chunk_json, msg_id, model_name, is_first):
 
     choice = choices[0]
     delta = choice.get("delta", {})
+    content = _chunk_text(choice)
 
     if is_first:
         events.append({
@@ -454,7 +467,7 @@ def _openai_chunk_to_anthropic_events(chunk_json, msg_id, model_name, is_first):
         })
         is_first = False
 
-    if delta.get("content"):
+    if content:
         events.append({
             "type": "content_block_start",
             "index": 0,
@@ -463,7 +476,7 @@ def _openai_chunk_to_anthropic_events(chunk_json, msg_id, model_name, is_first):
         events.append({
             "type": "content_block_delta",
             "index": 0,
-            "delta": {"type": "text_delta", "text": delta["content"]}
+            "delta": {"type": "text_delta", "text": content}
         })
 
     if delta.get("tool_calls"):
@@ -711,10 +724,11 @@ def _openai_chunk_to_gemini_chunk(chunk_json, msg_id):
 
     choice = choices[0]
     delta = choice.get("delta", {})
+    content = _chunk_text(choice)
     parts = []
 
-    if delta.get("content"):
-        parts.append({"text": delta["content"]})
+    if content:
+        parts.append({"text": content})
 
     if delta.get("tool_calls"):
         for tc in delta["tool_calls"]:
@@ -930,6 +944,7 @@ def _openai_chunk_to_responses_events(chunk_json, resp_id, is_first):
 
     choice = choices[0]
     delta = choice.get("delta", {})
+    content = _chunk_text(choice)
 
     if is_first:
         events.append({
@@ -952,7 +967,7 @@ def _openai_chunk_to_responses_events(chunk_json, resp_id, is_first):
             }
         })
 
-    if delta.get("content"):
+    if content:
         if is_first:
             events.append({
                 "type": "response.output_item.added",
@@ -975,7 +990,7 @@ def _openai_chunk_to_responses_events(chunk_json, resp_id, is_first):
             "type": "response.output_text.delta",
             "output_index": 0,
             "content_index": 0,
-            "delta": delta["content"]
+            "delta": content
         })
 
     if delta.get("tool_calls"):
