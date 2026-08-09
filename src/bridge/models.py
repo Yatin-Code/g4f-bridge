@@ -51,6 +51,9 @@ def get_all_models():
             if before > after:
                 logger.info(f"  -> Filtered out {before - after} non-operational EAON models")
 
+    if "AGENTROUTER" in BACKENDS:
+        all_models.extend(fetch_agentrouter_models())
+
     if "PA" in BACKENDS:
         pa_url = BACKENDS["PA"]["url"].rstrip("/")
         logger.info(f"Fetching PA providers from {pa_url}/pa/providers")
@@ -82,8 +85,42 @@ def get_all_models():
         except Exception as e:
             logger.warning(f"Failed to fetch PA providers: {e}")
 
+    if "OMNIROUTE" in BACKENDS:
+        all_models.extend(fetch_omniroute_models())
+
     all_models = sorted(all_models, key=lambda x: x["requests"], reverse=True)
     return all_models
+
+def fetch_omniroute_models():
+    if "OMNIROUTE" not in BACKENDS:
+        return []
+    logger.info(f"Fetching OmniRoute models from {BACKENDS['OMNIROUTE']['url']}/models")
+    try:
+        resp = requests.get(
+            f"{BACKENDS['OMNIROUTE']['url']}/models",
+            headers={"Authorization": f"Bearer {BACKENDS['OMNIROUTE']['key']}"},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json().get("data", [])
+        result = []
+        for m in data:
+            model_id = m.get("id")
+            if not model_id or model_id == "auto":
+                continue
+            result.append({
+                "id": model_id,
+                "label": f"OMNIROUTE:{model_id}",
+                "model": model_id,
+                "requests": 0,
+                "backend": "OMNIROUTE",
+                "owned_by": m.get("owned_by", ""),
+            })
+        logger.info(f"  -> {len(result)} OmniRoute models")
+        return result
+    except Exception as e:
+        logger.warning(f"Failed to fetch OmniRoute models: {e}")
+        return []
 
 def fetch_eaon_catalog():
     if "EAON" not in BACKENDS:
@@ -115,6 +152,32 @@ def fetch_eaon_catalog():
     except Exception as e:
         logger.warning(f"Failed to fetch EAON catalog: {e}")
         return []
+
+AGENTROUTER_STATIC_MODELS = [
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "gpt-5.6-sol",
+    "gpt-5.5",
+    "glm-5.2",
+]
+
+def fetch_agentrouter_models():
+    if "AGENTROUTER" not in BACKENDS:
+        return []
+    result = [
+        {
+            "id": model_id,
+            "label": f"agentrouter:{model_id}",
+            "model": model_id,
+            "requests": 0,
+            "backend": "AGENTROUTER",
+        }
+        for model_id in AGENTROUTER_STATIC_MODELS
+    ]
+    logger.info(f"  -> {len(result)} static AGENTROUTER models")
+    return result
 
 def fetch_eaon_monitor():
     global EAON_OPERATIONAL_MODELS
