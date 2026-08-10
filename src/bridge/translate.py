@@ -218,6 +218,8 @@ def _openai_to_anthropic(payload):
         if not isinstance(msg, dict):
             continue
         role = msg.get("role", "user")
+        if role == "developer":
+            role = "system"
         content = msg.get("content")
 
         if role == "system":
@@ -797,6 +799,8 @@ def _responses_to_openai(payload):
                 continue
             item_type = item.get("type", "")
             role = item.get("role", "user")
+            if role == "developer":
+                role = "system"
 
             if item_type == "message" or role in ("user", "assistant", "system"):
                 content = item.get("content", "")
