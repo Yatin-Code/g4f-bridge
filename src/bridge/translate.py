@@ -1029,6 +1029,8 @@ def _openai_chunk_to_responses_events(chunk_json, resp_id, is_first):
         if finish == "length":
             incomplete_reason = "max_tokens"
 
+        usage = chunk_json.get("usage") or {}
+
         events.append({
             "type": "response.completed",
             "response": {
@@ -1036,9 +1038,28 @@ def _openai_chunk_to_responses_events(chunk_json, resp_id, is_first):
                 "object": "response",
                 "created_at": int(time.time()),
                 "status": status,
+                "error": None,
+                "incomplete_details": {"reason": incomplete_reason} if incomplete_reason else None,
+                "instructions": None,
+                "max_output_tokens": None,
                 "model": chunk_json.get("model", ""),
                 "output": [],
-                "usage": {}
+                "parallel_tool_calls": True,
+                "previous_response_id": None,
+                "reasoning": {"effort": None, "summary": None},
+                "store": False,
+                "temperature": None,
+                "text": {"format": {"type": "text"}},
+                "tool_choice": "auto",
+                "tools": [],
+                "top_p": None,
+                "truncation": "disabled",
+                "usage": {
+                    "input_tokens": usage.get("prompt_tokens", 0),
+                    "output_tokens": usage.get("completion_tokens", 0),
+                    "total_tokens": usage.get("total_tokens",
+                        usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0))
+                }
             }
         })
 
