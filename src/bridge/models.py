@@ -88,8 +88,42 @@ def get_all_models():
     if "OMNIROUTE" in BACKENDS:
         all_models.extend(fetch_omniroute_models())
 
+    if "RE" in BACKENDS:
+        all_models.extend(fetch_re_models())
+
     all_models = sorted(all_models, key=lambda x: x["requests"], reverse=True)
     return all_models
+
+def fetch_re_models():
+    if "RE" not in BACKENDS:
+        return []
+    logger.info(f"Fetching RE models from {BACKENDS['RE']['url']}/models")
+    try:
+        resp = requests.get(
+            f"{BACKENDS['RE']['url']}/models",
+            headers={"Authorization": f"Bearer {BACKENDS['RE']['key']}"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json().get("data", [])
+        result = []
+        for m in data:
+            model_id = m.get("id")
+            if not model_id or model_id == "auto":
+                continue
+            result.append({
+                "id": model_id,
+                "label": f"RE:{model_id}",
+                "model": model_id,
+                "requests": 0,
+                "backend": "RE",
+                "owned_by": m.get("owned_by", ""),
+            })
+        logger.info(f"  -> {len(result)} RE models")
+        return result
+    except Exception as e:
+        logger.warning(f"Failed to fetch RE models: {e}")
+        return []
 
 def fetch_omniroute_models():
     if "OMNIROUTE" not in BACKENDS:

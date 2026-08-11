@@ -66,7 +66,56 @@ def _build_config(final_models, top_n=None):
                 "models": chunk
             }
 
+    agentrouter_models = {m["label"]: {"name": m["label"]} for m in final_models if m["backend"] == "AGENTROUTER"}
+    if agentrouter_models:
+        for i, chunk in enumerate(chunk_models(agentrouter_models, 15)):
+            name = "AGENTROUTER" if len(agentrouter_models) <= 15 else f"AGENTROUTER (Page {i+1})"
+            config["provider"][f"agentrouter-bridge-{i}"] = {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": name,
+                "options": {
+                    "baseURL": "http://127.0.0.1:1337/v1",
+                    "apiKey": "dummy_key"
+                },
+                "models": chunk
+            }
+
+    omniroute_models = {m["label"]: {"name": m["label"]} for m in final_models if m["backend"] == "OMNIROUTE"}
+    if omniroute_models:
+        for i, chunk in enumerate(chunk_models(omniroute_models, 15)):
+            name = "OMNIROUTE" if len(omniroute_models) <= 15 else f"OMNIROUTE (Page {i+1})"
+            config["provider"][f"omniroute-bridge-{i}"] = {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": name,
+                "options": {
+                    "baseURL": "http://127.0.0.1:1337/v1",
+                    "apiKey": "dummy_key"
+                },
+                "models": chunk
+            }
+
+    re_models = {m["label"]: {"name": m["label"]} for m in final_models if m["backend"] == "RE"}
+    if re_models:
+        for i, chunk in enumerate(chunk_models(re_models, 15)):
+            name = "RE" if len(re_models) <= 15 else f"RE (Page {i+1})"
+            config["provider"][f"re-bridge-{i}"] = {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": name,
+                "options": {
+                    "baseURL": "http://127.0.0.1:1337/v1",
+                    "apiKey": "dummy_key"
+                },
+                "models": chunk
+            }
+
     return config
+
+
+BRIDGE_PROVIDER_PREFIXES = ("g4f-exact-bridge-", "eaon-bridge-", "pa-bridge-", "agentrouter-bridge-", "omniroute-bridge-", "re-bridge-")
+
+
+def _is_bridge_provider_key(key):
+    return key.startswith(BRIDGE_PROVIDER_PREFIXES)
 
 
 def write_config(final_models, top_n=None):
@@ -80,8 +129,13 @@ def write_config(final_models, top_n=None):
     if not isinstance(existing, dict):
         print(f"OpenCode: Existing config is not a JSON object, backing it up and overwriting.")
         existing = {}
+    if not isinstance(existing.get("provider"), dict):
+        existing["provider"] = {}
 
-    existing["provider"] = _build_config(final_models, top_n)["provider"]
+    for key in [k for k in existing["provider"] if _is_bridge_provider_key(k)]:
+        del existing["provider"][key]
+
+    existing["provider"].update(_build_config(final_models, top_n)["provider"])
 
     ok, err = _safe_write_json(config_path, existing)
     if ok:
