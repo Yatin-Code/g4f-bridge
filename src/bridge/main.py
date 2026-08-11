@@ -13,6 +13,7 @@ from .utils import (
     load_or_prompt_keys, manage_keys,
     _run_preflight_checks, _detect_config_conflicts,
     _safe_write_json, setup_logging,
+    _detect_installed_targets,
     increment_requests, decrement_requests, log_request_status,
 )
 from .models import (
@@ -999,7 +1000,7 @@ def cli_main():
     parser.add_argument("-s", "--setup", action="store_true",
                         help="Run API key setup wizard")
     parser.add_argument("--target", nargs="+", choices=TARGET_CHOICES, default=None,
-                        help=f"Target tools (default: opencode). Choices: {', '.join(TARGET_CHOICES)}")
+                        help=f"Target tools (default: all installed tools). Choices: {', '.join(TARGET_CHOICES)}")
     args = parser.parse_args()
 
     if args.keys:
@@ -1029,7 +1030,7 @@ def cli_main():
         sys.exit(0)
 
     if args.target is None:
-        targets = ["opencode"]
+        targets = _detect_installed_targets() or ["opencode"]
     elif "all" in args.target:
         targets = ALL_TARGETS
     else:

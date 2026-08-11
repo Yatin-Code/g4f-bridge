@@ -115,6 +115,32 @@ def _get_claude_code_config_dir():
 def _get_antigravity_config_dir():
     return os.path.join(os.path.expanduser("~"), ".gemini")
 
+_TARGET_CONFIG_DIRS = {
+    "opencode": _get_opencode_config_dir,
+    "codex": _get_codex_config_dir,
+    "cursor": _get_cursor_config_dir,
+    "claude-code": _get_claude_code_config_dir,
+    "antigravity": _get_antigravity_config_dir,
+}
+
+_TARGET_BINARIES = {
+    "opencode": ("opencode",),
+    "codex": ("codex",),
+    "cursor": ("cursor",),
+    "claude-code": ("claude",),
+    "antigravity": ("gemini", "antigravity"),
+}
+
+def _detect_installed_targets():
+    """Targets whose config dir or CLI binary exists on this machine."""
+    installed = []
+    for target in ALL_TARGETS:
+        if os.path.isdir(_TARGET_CONFIG_DIRS[target]()) or any(
+            shutil.which(binary) for binary in _TARGET_BINARIES[target]
+        ):
+            installed.append(target)
+    return installed
+
 PROVIDER_DEFAULTS = {
     "G4F": {"url": "https://g4f.space/v1", "key": ""},
     "EAON": {"url": "https://api.eaon.dev/v1", "key": ""},
