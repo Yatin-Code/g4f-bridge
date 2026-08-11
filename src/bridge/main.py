@@ -512,7 +512,7 @@ async def responses_create(request: Request):
 
             async def responses_stream_generator():
                 logger.info("[Responses] Streaming response back")
-                is_first = True
+                state = {"started": False, "item_added": False}
                 try:
                     async for line in resp.aiter_lines():
                         if await request.is_disconnected():
@@ -526,9 +526,7 @@ async def responses_create(request: Request):
                             break
                         try:
                             chunk_json = json.loads(data_str)
-                            events = _openai_chunk_to_responses_events(chunk_json, resp_id, is_first)
-                            if events:
-                                is_first = False
+                            events = _openai_chunk_to_responses_events(chunk_json, resp_id, state)
                             for event in events:
                                 yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode('utf-8')
                         except (json.JSONDecodeError, IndexError, KeyError):
@@ -820,8 +818,6 @@ async def chat_completions(request: Request):
                                             if "role" in choice["delta"]:
                                                 del choice["delta"]["role"]
                                         delta_content = _chunk_text(choice)
-                                        if delta_content is not None and not choice["delta"].get("content"):
-                                            choice["delta"]["content"] = delta_content
                                         delta_text = ""
                                         if isinstance(delta_content, str):
                                             delta_text = delta_content

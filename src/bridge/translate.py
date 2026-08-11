@@ -200,15 +200,12 @@ def _anthropic_to_openai(payload):
     return result
 
 def _chunk_text(choice):
-    """Text from an OpenAI stream choice: delta.content, message.content,
-    or reasoning_content (GLM/thinking models stream output there with
-    content=null; some proxies put the full message in `message`)."""
+    """Text content from an OpenAI stream choice: delta.content, falling
+    back to message.content (proxies that return the full message inline)."""
     delta = choice.get("delta") or {}
     content = delta.get("content")
     if content is None:
         content = (choice.get("message") or {}).get("content")
-    if not content:
-        content = delta.get("reasoning_content")
     return content
 
 def _openai_to_anthropic(payload):
@@ -940,7 +937,7 @@ def _openai_to_responses_response(resp_json):
         }
     }
 
-def _openai_chunk_to_responses_events(chunk_json, resp_id, is_first):
+def _openai_chunk_to_responses_events(chunk_json, resp_id, state):
     events = []
     choices = chunk_json.get("choices", [])
     if not choices:
@@ -950,7 +947,8 @@ def _openai_chunk_to_responses_events(chunk_json, resp_id, is_first):
     delta = choice.get("delta", {})
     content = _chunk_text(choice)
 
-    if is_first:
+    if not state.get("started"):
+        state["started"] = True
         events.append({
             "type": "response.created",
             "response": {
@@ -972,7 +970,8 @@ def _openai_chunk_to_responses_events(chunk_json, resp_id, is_first):
         })
 
     if content:
-        if is_first:
+        if not state.get("item_added"):
+            state["item_added"] = True
             events.append({
                 "type": "response.output_item.added",
                 "output_index": 0,
@@ -995,6 +994,14 @@ def _openai_chunk_to_responses_events(chunk_json, resp_id, is_first):
             "output_index": 0,
             "content_index": 0,
             "delta": content
+        })
+
+    reasoning = delta.get("reasoning_content")
+    if reasoning:
+        events.append({
+            "type": "response.reasoning_summary_text.delta",
+            "output_index": 0,
+            "delta": reasoning
         })
 
     if delta.get("tool_calls"):
