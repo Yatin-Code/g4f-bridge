@@ -17,6 +17,11 @@ def _resolve_model(requested_label):
 
 def get_all_models():
     all_models = []
+    # G4F family (g4f.space gateway + its PA providers): models are listed
+    # per upstream server (e.g. "crowllm.com:glm-5.2"), which pins requests
+    # to a server that may be down. Dedupe by the clean upstream name and
+    # let the gateway auto-route to a working provider.
+    g4f_by_name = {}
 
     if "G4F" in BACKENDS:
         logger.info(f"Fetching models from {BACKENDS['G4F']['url']}/models")
@@ -28,15 +33,18 @@ def get_all_models():
             resp.raise_for_status()
             data = resp.json().get("data", [])
             for m in data:
-                if m.get("id") == "auto": continue
-                all_models.append({
-                    "id": m.get("id"),
-                    "label": m.get("label", m.get("id")),
-                    "model": m.get("model", ""),
-                    "requests": m.get("requests", 0),
-                    "backend": "G4F"
-                })
-            logger.info(f"  -> {len([m for m in all_models if m['backend']=='G4F'])} G4F models")
+                name = (m.get("model") or m.get("id") or "").strip()
+                if not name or name == "auto":
+                    continue
+                existing = g4f_by_name.get(name)
+                if existing is None or m.get("requests", 0) > existing.get("requests", 0):
+                    g4f_by_name[name] = {
+                        "id": name,
+                        "label": name,
+                        "model": name,
+                        "requests": m.get("requests", 0),
+                        "backend": "G4F"
+                    }
         except Exception as e:
             logger.warning(f"Failed to fetch G4F models: {e}")
 
@@ -51,6 +59,9 @@ def get_all_models():
             if before > after:
                 logger.info(f"  -> Filtered out {before - after} non-operational EAON models")
 
+    if "EAON" in BACKENDS:
+        all_models.extend(fetch_eaon_static_beta_models())
+
     if "AGENTROUTER" in BACKENDS:
         all_models.extend(fetch_agentrouter_models())
 
@@ -61,29 +72,28 @@ def get_all_models():
             resp = requests.get(f"{pa_url}/pa/providers", timeout=15)
             if resp.status_code == 200:
                 providers = resp.json()
-                total = 0
+                pa_new = 0
                 for prov in providers:
-                    label = prov.get("label", "?")
-                    models = prov.get("models", [])
-                    for mid in models:
-                        if mid and mid.strip():
-                            all_models.append({
-                                "id": mid,
-                                "label": f"PA:{label}:{mid}",
-                                "model": mid,
+                    for mid in prov.get("models", []):
+                        name = (mid or "").strip()
+                        if not name or name == "auto":
+                            continue
+                        if name not in g4f_by_name:
+                            g4f_by_name[name] = {
+                                "id": name,
+                                "label": name,
+                                "model": name,
                                 "requests": 0,
-                                "backend": "PA",
-                                "provider_id": prov.get("id", ""),
-                            })
-                            total += 1
-                logger.info(f"  -> {total} PA models from {len(providers)} providers")
-                if providers:
-                    for prov in providers:
-                        logger.info(f"     {prov.get('label','?')}: {len(prov.get('models',[]))} models")
+                                "backend": "G4F"
+                            }
+                            pa_new += 1
+                logger.info(f"  -> {len(g4f_by_name)} G4F models ({pa_new} unique from PA providers)")
             else:
                 logger.warning(f"PA providers endpoint returned {resp.status_code}")
         except Exception as e:
             logger.warning(f"Failed to fetch PA providers: {e}")
+
+    all_models.extend(g4f_by_name.values())
 
     if "OMNIROUTE" in BACKENDS:
         all_models.extend(fetch_omniroute_models())
@@ -196,6 +206,45 @@ AGENTROUTER_STATIC_MODELS = [
     "gpt-5.5",
     "glm-5.2",
 ]
+
+# EAON beta-tier models guaranteed available regardless of the dynamic
+# catalog/monitor. usage_limit = how much a request counts against the
+# beta quota (0 = free). None means no limit tracking.
+EAON_STATIC_BETA_MODELS = [
+    {"id": "deepseek-v4-flash", "usage_limit": 0.0},
+    {"id": "mimo-v2.5", "usage_limit": 0.0},
+    {"id": "hy3", "usage_limit": 1.0},
+    {"id": "deepseek-v4-pro", "usage_limit": 1.1},
+    {"id": "mimo-v2.5-pro", "usage_limit": 1.1},
+    {"id": "qwen3.7-plus", "usage_limit": 1.25},
+    {"id": "minimax-m2.7", "usage_limit": 1.65},
+    {"id": "qwen3.6-plus", "usage_limit": 1.7},
+    {"id": "minimax-m3", "usage_limit": 1.7},
+    {"id": "gpt-5.6-luna", "usage_limit": 3.0},
+    {"id": "kimi-k2.7-code", "usage_limit": 4.1},
+    {"id": "kimi-k2.6", "usage_limit": 4.8},
+    {"id": "glm-5.2", "usage_limit": 18.2},
+    {"id": "qwen3.7-max", "usage_limit": 18.2},
+    {"id": "grok-4.5", "usage_limit": 142.0},
+    {"id": "qwen3.8-max", "usage_limit": 142.0},
+    {"id": "kimi-k3", "usage_limit": None},
+]
+
+def fetch_eaon_static_beta_models():
+    if "EAON" not in BACKENDS:
+        return []
+    return [
+        {
+            "id": entry["id"],
+            "label": f"EAON:{entry['id']}",
+            "model": entry["id"],
+            "requests": 0,
+            "backend": "EAON",
+            "tier": "beta",
+            "usage_limit": entry["usage_limit"],
+        }
+        for entry in EAON_STATIC_BETA_MODELS
+    ]
 
 def fetch_agentrouter_models():
     if "AGENTROUTER" not in BACKENDS:
