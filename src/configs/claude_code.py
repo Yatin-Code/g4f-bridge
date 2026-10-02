@@ -19,6 +19,29 @@ def write_config(final_models, top_n=None):
     existing["env"].pop("CLAUDE_CODE_USE_VERTEX", None)
     existing["env"].pop("CLAUDE_CODE_USE_FOUNDRY", None)
     existing["forceLoginMethod"] = "console"
+
+    # Never force a specific model — let the user choose from the bridge list.
+    # Remove any stale 'model' / 'globalModel' that would lock Claude Code onto
+    # a single model and prevent it from showing the full bridge catalogue.
+    for stale_key in ("model", "globalModel"):
+        if stale_key in existing:
+            print(f"  Removing stale '{stale_key}': {existing.pop(stale_key)}")
+
+    # Purge any per-model settings whose key contains a bridge-injected prefix
+    # (e.g. "claude-gemini-…") to avoid lingering overrides.
+    if "modelSettings" in existing:
+        bridge_prefixes = ("claude-gemini-", "claude-gpt-", "claude-grok-",
+                           "claude-qwen-", "claude-kimi-", "claude-mistral-")
+        to_remove = [
+            k for k in existing["modelSettings"]
+            if any(k.startswith(pfx) for pfx in bridge_prefixes)
+        ]
+        for k in to_remove:
+            print(f"  Removing stale modelSettings entry: {k}")
+            del existing["modelSettings"][k]
+        if not existing["modelSettings"]:
+            del existing["modelSettings"]
+
     ok, err = _safe_write_json(settings_path, existing)
     if ok:
         print(f"Claude Code: {settings_path} successfully updated!")

@@ -16,6 +16,7 @@ tui/dist/
 *.swp
 *.swo
 *~
+.env
 
 # OS
 .DS_Store

@@ -210,6 +210,15 @@ AGENTROUTER_STATIC_MODELS = [
 # EAON beta-tier models guaranteed available regardless of the dynamic
 # catalog/monitor. usage_limit = how much a request counts against the
 # beta quota (0 = free). None means no limit tracking.
+#
+# ⚠️  PRIORITY MODELS — require an EAON API key to become available:
+#   • kimi-k2.6 / kimi-k2.7-code / kimi-k3  (Moonshot AI)
+#   • grok-4.5                               (xAI)
+#   • qwen3.7-max / qwen3.8-max              (Alibaba)
+#   • gpt-5.6-luna                           (OpenAI via EAON)
+#
+# To activate: run  g4f-bridge --keys  and enter your EAON key.
+# Get a key at: https://api.eaon.dev
 EAON_STATIC_BETA_MODELS = [
     {"id": "deepseek-v4-flash", "usage_limit": 0.0},
     {"id": "mimo-v2.5", "usage_limit": 0.0},

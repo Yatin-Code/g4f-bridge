@@ -124,6 +124,7 @@ async def list_models(request: Request):
     models = []
     claude_entries = []
     seen_claude_names = set()
+
     for label, m in MODEL_MAP.items():
         if ACTIVE_MODELS and label not in ACTIVE_MODELS:
             continue
@@ -140,6 +141,9 @@ async def list_models(request: Request):
             "created_at": now_iso,
             "capabilities": {"image_input": {"supported": False}},
         })
+        
+        # Claude Code UI filters out any model that doesn't look like a Claude model.
+        # We MUST generate a "claude-*" alias for every model so they show up.
         claude_name = f"claude-{display}"
         if claude_name not in seen_claude_names and claude_name != label:
             seen_claude_names.add(claude_name)
@@ -155,6 +159,7 @@ async def list_models(request: Request):
             })
     all_entries = models + claude_entries
     return {"object": "list", "data": all_entries}
+
 
 @app.post("/v1/messages/count_tokens")
 async def anthropic_count_tokens(request: Request):
@@ -893,6 +898,48 @@ async def chat_completions(request: Request):
         logger.exception(f"Critical error during proxying")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
+# Families and per-family caps for the --priority mode.
+# Gemini is capped at 3 to avoid drowning the other families.
+PRIORITY_FAMILIES = [
+    ("kimi",   None),
+    ("claude", None),
+    ("grok",   None),
+    ("gpt-5",  None),
+    ("qwen",   None),
+    ("gemini", 3),
+]
+
+def priority_model_selection(all_models):
+    """
+    Auto-select models matching the 6 priority families without any interactive
+    prompt.  Each family is matched by a case-insensitive substring on the model
+    label.  Optional per-family caps prevent Gemini from dominating the list.
+    Within each family models are sorted by request count (descending) so the
+    most popular variant comes first.
+    """
+    selected = []
+    seen_labels = set()
+
+    for keyword, cap in PRIORITY_FAMILIES:
+        matches = [
+            m for m in all_models
+            if keyword in m.get("label", "").lower()
+            and m["label"] not in seen_labels
+        ]
+        # Sort by request popularity (descending)
+        matches.sort(key=lambda m: m.get("requests", 0), reverse=True)
+        if cap is not None:
+            matches = matches[:cap]
+        for m in matches:
+            seen_labels.add(m["label"])
+            selected.append(m)
+
+    logger.info(f"[--priority] Auto-selected {len(selected)} models across {len(PRIORITY_FAMILIES)} families:")
+    for kw, _ in PRIORITY_FAMILIES:
+        fam = [m["label"] for m in selected if kw in m["label"].lower()]
+        logger.info(f"  {kw:8s}: {len(fam)} models")
+    return selected
+
 def generate_opencode_config(selected_models=None, do_test=False, top_n=None, targets=None):
     global MODEL_MAP, CLAUDE_MODEL_MAP, ACTIVE_MODELS
     MODEL_MAP.clear()
@@ -1001,6 +1048,13 @@ def cli_main():
                         help="Run API key setup wizard")
     parser.add_argument("--target", nargs="+", choices=TARGET_CHOICES, default=None,
                         help=f"Target tools (default: all installed tools). Choices: {', '.join(TARGET_CHOICES)}")
+    parser.add_argument("--priority", action="store_true",
+                        help=(
+                            "Auto-select models from the 6 priority families "
+                            "(kimi, claude, grok, gpt-5, qwen, gemini) without interactive prompt. "
+                            "Limits Gemini to 3 models to avoid drowning the others. "
+                            "Combine with --target to restrict to specific tools."
+                        ))
     args = parser.parse_args()
 
     if args.keys:
@@ -1037,15 +1091,24 @@ def cli_main():
         targets = args.target
 
     if args.setup:
-        if not args.model and args.best is None:
+        if not args.model and args.best is None and not args.priority:
             sys.exit(0)
 
-    if args.model or args.best is not None or not args.setup:
-        if args.model or args.best is not None:
+    if args.model or args.best is not None or args.priority or not args.setup:
+        if args.model or args.best is not None or args.priority:
             logger.info("Running pre-flight checks...")
             _run_preflight_checks(targets)
 
-    if args.model:
+    if args.priority:
+        all_models = get_all_models()
+        if not all_models:
+            sys.exit(1)
+        selected = priority_model_selection(all_models)
+        if not selected:
+            logger.error("No priority models found in the available model list.")
+            sys.exit(1)
+        generate_opencode_config(selected_models=selected, do_test=args.test, targets=targets)
+    elif args.model:
         all_models = get_all_models()
         if not all_models:
             sys.exit(1)
@@ -1061,18 +1124,25 @@ def cli_main():
         if not all_models:
             logger.error("No models available from any backend.")
             sys.exit(1)
-        print(f"\nAvailable models ({len(all_models)} total):\n")
-        for i, m in enumerate(all_models[:30], 1):
+            
+        print("\nNo specific model filters provided. Applying priority families by default...")
+        selected = priority_model_selection(all_models)
+        if not selected:
+            logger.error("No priority models found. Exiting.")
+            sys.exit(1)
+            
+        print(f"\nAvailable models ({len(selected)} priority models out of {len(all_models)} total):\n")
+        for i, m in enumerate(selected[:30], 1):
             backend_tag = m.get("backend", "?")
             label = m.get("label", m.get("id", "?"))
             display = label.split(":")[-1].split("/")[-1]
             print(f"  {i:>3}. [{backend_tag}] {display:35s} {m.get('requests', 0):>8,} requests")
-        if len(all_models) > 30:
-            print(f"\n  ... and {len(all_models) - 30} more (use -l to list all)")
+        if len(selected) > 30:
+            print(f"\n  ... and {len(selected) - 30} more (use -l to list all)")
         print()
 
-        logger.info(f"Generating config for {len(all_models)} models")
-        generate_opencode_config(selected_models=all_models, do_test=False, targets=targets)
+        logger.info(f"Generating config for {len(selected)} priority models")
+        generate_opencode_config(selected_models=selected, do_test=False, targets=targets)
 
     print(f"\nStarting Bridge on http://127.0.0.1:{PORT} ...")
     logger.info(f"Bridge running on http://127.0.0.1:{PORT}")
